@@ -1,0 +1,42 @@
+# Video and media files
+downloads/
+clips/
+frames/
+*.mp4
+*.avi
+*.mkv
+
+# Metadata output
+metadata/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+pipeline.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Template images (user-specific)
+kill_templates/*.png
+!kill_templates/.gitkeep

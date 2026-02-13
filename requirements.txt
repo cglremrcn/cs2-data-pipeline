@@ -1,0 +1,4 @@
+opencv-python>=4.10.0
+numpy
+flask>=3.0.0
+yt-dlp
