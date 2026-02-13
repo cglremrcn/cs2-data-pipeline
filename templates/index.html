@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CS2 Data Pipeline</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>CS2 <span>Kill Detector</span></h1>
+            <p>Medal.tv kliplerinden kill anlarini tespit et ve klipleri kes</p>
+        </div>
+
+        <!-- Template Status -->
+        {% if not template_exists %}
+        <div class="template-warning" id="templateWarning">
+            &#9888; Template bulunamadi. Isleme baslamadan once bir kill ikonu template'i olusturun.
+            <button class="btn btn-secondary" onclick="openTemplateModal()" style="margin-left:auto; white-space:nowrap">
+                Template Olustur
+            </button>
+        </div>
+        {% else %}
+        <div class="template-ok" id="templateOk">
+            &#10003; Template hazir. Isleme baslatabilirsiniz.
+        </div>
+        {% endif %}
+
+        <!-- URL Input -->
+        <div class="card">
+            <div class="card-title">Video Isleme</div>
+            <div class="input-group">
+                <input type="text" id="urlInput" placeholder="Medal.tv URL yapistirin..."
+                       autocomplete="off" spellcheck="false">
+                <button class="btn btn-primary" id="startBtn" onclick="startPipeline()">
+                    Baslat
+                </button>
+            </div>
+        </div>
+
+        <!-- Status Section -->
+        <div class="card status-section" id="statusSection">
+            <div class="card-title">Durum</div>
+            <div class="phases">
+                <div class="phase" id="phase-download">Indirme</div>
+                <div class="phase" id="phase-detect">Tespit</div>
+                <div class="phase" id="phase-cut">Kesme</div>
+                <div class="phase" id="phase-metadata">Metadata</div>
+            </div>
+            <div class="status-bar">
+                <div class="spinner" id="statusSpinner"></div>
+                <span class="status-text" id="statusText">Baslatiliyor...</span>
+            </div>
+        </div>
+
+        <!-- Results Section -->
+        <div class="card results-section" id="resultsSection">
+            <div class="card-title">Sonuclar</div>
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="statKills">0</div>
+                    <div class="stat-label">Kill Tespit</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="statClips">0</div>
+                    <div class="stat-label">Klip Olusturuldu</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="statTime">0s</div>
+                    <div class="stat-label">Islem Suresi</div>
+                </div>
+            </div>
+            <table class="detections-table" id="detectionsTable">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Zaman</th>
+                        <th>Guven</th>
+                        <th>Klip</th>
+                    </tr>
+                </thead>
+                <tbody id="detectionsBody"></tbody>
+            </table>
+        </div>
+
+        <!-- History -->
+        <div class="card">
+            <div class="card-title">Gecmis Islemler</div>
+            <div class="history-list" id="historyList">
+                <span style="color:#444; font-size:13px">Yukleniyor...</span>
+            </div>
+        </div>
+
+        <div class="footer">CS2 Data Pipeline v1.0</div>
+    </div>
+
+    <!-- Template Creation Modal -->
+    <div class="modal-overlay" id="templateModal">
+        <div class="modal">
+            <div class="modal-title">Template Olustur</div>
+            <p style="color:#888; font-size:14px; margin-bottom:16px">
+                Kill ikonunu tanimlamak icin bir Medal.tv URL'si girin. Video indirilecek ve kareler cikarilacak.
+                Bir kareye tiklayin, sonra kill ikonunu secin.
+            </p>
+
+            <div class="input-group" style="margin-bottom:16px">
+                <input type="text" id="templateUrlInput" placeholder="Medal.tv URL (kill iceren bir klip)...">
+                <button class="btn btn-primary" id="templateExtractBtn" onclick="extractFrames()">
+                    Kareleri Cikar
+                </button>
+            </div>
+
+            <div id="templateStatus" style="color:#888; font-size:13px; margin-bottom:12px"></div>
+
+            <div class="frames-grid" id="framesGrid"></div>
+
+            <!-- Selected frame for cropping -->
+            <div id="cropSection" style="display:none; margin-top:20px">
+                <p style="color:#ccc; font-size:14px; margin-bottom:10px">
+                    Kill ikonunun uzerine tiklayip surukleyerek secin:
+                </p>
+                <div class="crop-container" id="cropContainer">
+                    <canvas id="cropCanvas"></canvas>
+                </div>
+                <div style="display:flex; gap:8px; margin-top:8px">
+                    <span id="cropInfo" style="color:#666; font-size:12px"></span>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeTemplateModal()">Iptal</button>
+                <button class="btn btn-primary" id="saveTplBtn" onclick="saveTemplate()" style="display:none">
+                    Template'i Kaydet
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentSessionId = null;
+        let pollInterval = null;
+        let selectedFramePath = null;
+        let cropData = null;
+
+        // ============================================================
+        // Pipeline Processing
+        // ============================================================
+
+        function startPipeline() {
+            const url = document.getElementById('urlInput').value.trim();
+            if (!url) return;
+
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('statusSection').classList.add('active');
+            document.getElementById('resultsSection').classList.remove('active');
+            resetPhases();
+
+            fetch('/api/process', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    showError(data.error);
+                    return;
+                }
+                currentSessionId = data.session_id;
+                pollInterval = setInterval(pollStatus, 1000);
+            })
+            .catch(err => showError(err.message));
+        }
+
+        function pollStatus() {
+            if (!currentSessionId) return;
+
+            fetch(`/api/status/${currentSessionId}`)
+            .then(r => r.json())
+            .then(data => {
+                updateStatus(data.status);
+
+                if (data.done) {
+                    clearInterval(pollInterval);
+                    document.getElementById('startBtn').disabled = false;
+
+                    if (data.result && data.result.status === 'completed') {
+                        showResults(data.result);
+                    } else if (data.result && data.result.status === 'no_kills') {
+                        document.getElementById('statusText').textContent = 'Kill tespit edilemedi.';
+                        document.getElementById('statusText').className = 'status-text status-error';
+                        document.getElementById('statusSpinner').style.display = 'none';
+                    } else if (data.result && data.result.error) {
+                        showError(data.result.error);
+                    }
+                    loadHistory();
+                }
+            });
+        }
+
+        function updateStatus(status) {
+            const text = document.getElementById('statusText');
+            text.textContent = status.message || '';
+
+            const phaseMap = {
+                'downloading': 'download',
+                'detecting': 'detect',
+                'cutting': 'cut',
+                'metadata': 'metadata',
+                'done': 'metadata',
+            };
+
+            const phases = ['download', 'detect', 'cut', 'metadata'];
+            const currentIdx = phases.indexOf(phaseMap[status.phase] || '');
+
+            phases.forEach((p, i) => {
+                const el = document.getElementById(`phase-${p}`);
+                el.className = 'phase';
+                if (i < currentIdx) el.classList.add('done');
+                else if (i === currentIdx) el.classList.add('active');
+            });
+
+            if (status.phase === 'done') {
+                phases.forEach(p => {
+                    document.getElementById(`phase-${p}`).className = 'phase done';
+                });
+                text.className = 'status-text status-done';
+                document.getElementById('statusSpinner').style.display = 'none';
+            }
+        }
+
+        function showResults(result) {
+            document.getElementById('resultsSection').classList.add('active');
+            document.getElementById('statKills').textContent = result.kills_detected;
+            document.getElementById('statClips').textContent = result.clips_created;
+            document.getElementById('statTime').textContent = result.processing_time + 's';
+
+            // Load metadata for details
+            if (result.metadata_path) {
+                fetch(`/api/status/${currentSessionId}`)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.result) {
+                        populateDetections(data.result);
+                    }
+                });
+            }
+        }
+
+        function populateDetections(result) {
+            const tbody = document.getElementById('detectionsBody');
+            tbody.innerHTML = '';
+
+            if (!result.clip_paths) return;
+
+            result.clip_paths.forEach((clipPath, i) => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${i + 1}</td>
+                    <td>Klip ${i + 1}</td>
+                    <td><div class="confidence-bar" style="width:60px"></div></td>
+                    <td><a href="/${clipPath}" target="_blank" style="color:#ff4655">Indir</a></td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function resetPhases() {
+            ['download', 'detect', 'cut', 'metadata'].forEach(p => {
+                document.getElementById(`phase-${p}`).className = 'phase';
+            });
+            document.getElementById('statusSpinner').style.display = '';
+            document.getElementById('statusText').className = 'status-text';
+        }
+
+        function showError(msg) {
+            document.getElementById('statusText').textContent = 'Hata: ' + msg;
+            document.getElementById('statusText').className = 'status-text status-error';
+            document.getElementById('statusSpinner').style.display = 'none';
+            document.getElementById('startBtn').disabled = false;
+        }
+
+        // ============================================================
+        // Template Creation
+        // ============================================================
+
+        function openTemplateModal() {
+            document.getElementById('templateModal').classList.add('active');
+        }
+
+        function closeTemplateModal() {
+            document.getElementById('templateModal').classList.remove('active');
+        }
+
+        function extractFrames() {
+            const url = document.getElementById('templateUrlInput').value.trim();
+            if (!url) return;
+
+            const btn = document.getElementById('templateExtractBtn');
+            btn.disabled = true;
+            btn.textContent = 'Indiriliyor...';
+            document.getElementById('templateStatus').textContent = 'Video indiriliyor ve kareler cikariliyor...';
+
+            fetch('/api/template/create', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url})
+            })
+            .then(r => r.json())
+            .then(data => {
+                btn.disabled = false;
+                btn.textContent = 'Kareleri Cikar';
+
+                if (data.error) {
+                    document.getElementById('templateStatus').textContent = 'Hata: ' + data.error;
+                    return;
+                }
+
+                document.getElementById('templateStatus').textContent =
+                    `${data.frames.length} kare cikarildi. Kill iceren bir kareye tiklayin.`;
+
+                const grid = document.getElementById('framesGrid');
+                grid.innerHTML = '';
+
+                data.frames.forEach(framePath => {
+                    const div = document.createElement('div');
+                    div.className = 'frame-item';
+                    div.innerHTML = `<img src="/${framePath}" alt="frame">`;
+                    div.onclick = () => selectFrame(framePath, div);
+                    grid.appendChild(div);
+                });
+            })
+            .catch(err => {
+                btn.disabled = false;
+                btn.textContent = 'Kareleri Cikar';
+                document.getElementById('templateStatus').textContent = 'Hata: ' + err.message;
+            });
+        }
+
+        function selectFrame(framePath, el) {
+            document.querySelectorAll('.frame-item').forEach(e => e.classList.remove('selected'));
+            el.classList.add('selected');
+            selectedFramePath = framePath;
+            setupCropper(framePath);
+        }
+
+        function setupCropper(framePath) {
+            const section = document.getElementById('cropSection');
+            section.style.display = 'block';
+
+            const canvas = document.getElementById('cropCanvas');
+            const ctx = canvas.getContext('2d');
+            const img = new Image();
+
+            img.onload = () => {
+                // Scale to fit
+                const maxW = 760;
+                const scale = Math.min(1, maxW / img.width);
+                canvas.width = img.width * scale;
+                canvas.height = img.height * scale;
+                canvas.dataset.scale = scale;
+                canvas.dataset.imgW = img.width;
+                canvas.dataset.imgH = img.height;
+
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                // Mouse crop handlers
+                let startX, startY, dragging = false;
+
+                canvas.onmousedown = (e) => {
+                    const rect = canvas.getBoundingClientRect();
+                    startX = e.clientX - rect.left;
+                    startY = e.clientY - rect.top;
+                    dragging = true;
+                };
+
+                canvas.onmousemove = (e) => {
+                    if (!dragging) return;
+                    const rect = canvas.getBoundingClientRect();
+                    const curX = e.clientX - rect.left;
+                    const curY = e.clientY - rect.top;
+
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                    ctx.strokeStyle = '#ff4655';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(startX, startY, curX - startX, curY - startY);
+
+                    // Dark overlay outside selection
+                    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+                    ctx.fillRect(0, 0, canvas.width, Math.min(startY, curY));
+                    ctx.fillRect(0, Math.max(startY, curY), canvas.width, canvas.height - Math.max(startY, curY));
+                    ctx.fillRect(0, Math.min(startY, curY), Math.min(startX, curX), Math.abs(curY - startY));
+                    ctx.fillRect(Math.max(startX, curX), Math.min(startY, curY),
+                                 canvas.width - Math.max(startX, curX), Math.abs(curY - startY));
+                };
+
+                canvas.onmouseup = (e) => {
+                    if (!dragging) return;
+                    dragging = false;
+                    const rect = canvas.getBoundingClientRect();
+                    const endX = e.clientX - rect.left;
+                    const endY = e.clientY - rect.top;
+
+                    const sc = parseFloat(canvas.dataset.scale);
+                    cropData = {
+                        x: Math.round(Math.min(startX, endX) / sc),
+                        y: Math.round(Math.min(startY, endY) / sc),
+                        w: Math.round(Math.abs(endX - startX) / sc),
+                        h: Math.round(Math.abs(endY - startY) / sc),
+                    };
+
+                    document.getElementById('cropInfo').textContent =
+                        `Secim: ${cropData.w}x${cropData.h}px (x:${cropData.x}, y:${cropData.y})`;
+                    document.getElementById('saveTplBtn').style.display = '';
+                };
+            };
+
+            img.src = '/' + framePath;
+        }
+
+        function saveTemplate() {
+            if (!selectedFramePath || !cropData || cropData.w < 5 || cropData.h < 5) {
+                alert('Lutfen bir alan secin');
+                return;
+            }
+
+            const btn = document.getElementById('saveTplBtn');
+            btn.disabled = true;
+            btn.textContent = 'Kaydediliyor...';
+
+            fetch('/api/template/save', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    frame_path: selectedFramePath,
+                    crop: cropData
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                btn.disabled = false;
+                btn.textContent = "Template'i Kaydet";
+
+                if (data.error) {
+                    alert('Hata: ' + data.error);
+                    return;
+                }
+
+                closeTemplateModal();
+
+                // Update template status
+                const warning = document.getElementById('templateWarning');
+                if (warning) {
+                    warning.outerHTML = `<div class="template-ok" id="templateOk">
+                        &#10003; Template olusturuldu (${data.size}). Isleme baslatabilirsiniz.
+                    </div>`;
+                }
+            })
+            .catch(err => {
+                btn.disabled = false;
+                btn.textContent = "Template'i Kaydet";
+                alert('Hata: ' + err.message);
+            });
+        }
+
+        // ============================================================
+        // History
+        // ============================================================
+
+        function loadHistory() {
+            fetch('/api/sessions')
+            .then(r => r.json())
+            .then(sessions => {
+                const list = document.getElementById('historyList');
+                if (!sessions.length) {
+                    list.innerHTML = '<span style="color:#444; font-size:13px">Henuz islem yapilmadi.</span>';
+                    return;
+                }
+
+                list.innerHTML = sessions.map(s => `
+                    <div class="history-item">
+                        <div>
+                            <div style="color:#ccc; font-size:13px">${s.session_id}</div>
+                            <div style="color:#555; font-size:11px">${s.created_at.split('T')[0] || ''}</div>
+                        </div>
+                        <span class="kills-badge">${s.kills} kill &middot; ${s.clips} klip</span>
+                    </div>
+                `).join('');
+            });
+        }
+
+        // On page load
+        loadHistory();
+
+        // Enter key triggers start
+        document.getElementById('urlInput').addEventListener('keydown', e => {
+            if (e.key === 'Enter') startPipeline();
+        });
+    </script>
+</body>
+</html>
