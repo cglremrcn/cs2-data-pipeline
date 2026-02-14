@@ -34,7 +34,6 @@ DEFAULT_CONFIG = {
     # Audio kill sound detection
     "kill_sound_freq_low": 1800,
     "kill_sound_freq_high": 4500,
-    "audio_peak_multiplier": 3.5,
     "audio_window_ms": 50,
     "audio_hop_ms": 10,
 
@@ -45,6 +44,11 @@ DEFAULT_CONFIG = {
 
     # Cross-validation
     "cross_validate_window": 1.0,
+
+    # Audio fingerprinting (auto-calibration)
+    "fingerprint_snippet_ms": 250,
+    "fingerprint_ncc_threshold": 0.4,
+    "fingerprint_top_n": 15,
 
     # Clip Extraction
     "clip_pre_seconds": 3.0,
@@ -152,14 +156,14 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect personal kills using audio + visual cross-validation.
+        Detect personal kills using auto-calibrating audio fingerprinting
+        with visual cross-validation.
 
-        1. Visual: scan kill feed ROI for ANY kill events (timestamps)
-        2. Audio: scan for the player's kill confirmation sound (timestamps)
-        3. Cross-validate: keep only kills confirmed by BOTH signals (±1s)
-           - Audio spike without kill feed change → false positive (gunshot etc.)
-           - Kill feed change without audio → someone else's kill
-           - Both together → YOUR kill
+        1. Audio: two-pass fingerprinting to find the player's kill sound
+        2. Visual: scan kill feed ROI for ALL kill events
+        3. Cross-validate: keep audio detections confirmed by visual feed
+        4. Fallback: if audio fingerprinting succeeds but cross-validation
+           removes too many, trust fingerprinting alone
         Falls back to visual-only if audio is unavailable.
         """
         if progress_callback:
@@ -180,36 +184,46 @@ class CS2DataPipeline:
 
         logger.info(f"Video: {width}x{height}, {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
 
-        # Step 1: Visual detection — find ALL kill feed events
-        visual_dets = self._detect_kills_visual(
-            video_path, fps, total_frames, width, height, progress_callback
-        )
-        logger.info(f"Gorsel: {len(visual_dets)} kill feed olayı")
-
-        # Step 2: Audio detection — find personal kill sounds
+        # Step 1: Audio fingerprinting — find personal kill sounds
         audio_dets = []
         audio_path = self._extract_audio(video_path)
         if audio_path:
             try:
                 audio_dets = self._detect_kill_sounds(audio_path, fps)
-                logger.info(f"Ses: {len(audio_dets)} aday kill sesi")
+                logger.info(f"Ses fingerprint: {len(audio_dets)} kill sesi")
             except Exception as e:
                 logger.warning(f"Ses analizi basarisiz: {e}")
             finally:
                 audio_path.unlink(missing_ok=True)
 
+        # Step 2: Visual detection — find ALL kill feed events
+        visual_dets = self._detect_kills_visual(
+            video_path, fps, total_frames, width, height, progress_callback
+        )
+        logger.info(f"Gorsel: {len(visual_dets)} kill feed olayı")
+
         # Step 3: Cross-validate or fallback
         if audio_dets and visual_dets:
             raw_detections = self._cross_validate(audio_dets, visual_dets)
             logger.info(f"Cross-validation: {len(raw_detections)} onaylanmis kill")
+
+            # If cross-validation removed too many fingerprinted results,
+            # trust the fingerprinting (it's already filtered by NCC)
             if not raw_detections:
-                logger.warning("Cross-validation sonucu bos, gorsel tespite donuluyor")
-                raw_detections = visual_dets
+                logger.warning("Cross-validation bos, fingerprint sonuclari kullaniliyor")
+                raw_detections = audio_dets
+            elif len(raw_detections) < len(audio_dets) * 0.4:
+                logger.warning(f"Cross-validation cok fazla sildi ({len(raw_detections)}/{len(audio_dets)}), "
+                              f"fingerprint sonuclari kullaniliyor")
+                raw_detections = audio_dets
+        elif audio_dets:
+            logger.info("Gorsel tespit bos, fingerprint sonuclari kullaniliyor")
+            raw_detections = audio_dets
         elif visual_dets:
             logger.info("Ses bulunamadi, gorsel tespit kullaniliyor")
             raw_detections = visual_dets
         else:
-            raw_detections = audio_dets
+            raw_detections = []
 
         detections = self._apply_cooldown(raw_detections)
 
@@ -286,11 +300,17 @@ class CS2DataPipeline:
 
     def _detect_kill_sounds(self, audio_path, fps):
         """
-        Detect CS2 kill confirmation sounds using spectral flux analysis.
+        Auto-calibrating kill sound detection via audio fingerprinting.
 
-        The kill confirmation "ding" is a short, high-pitched metallic sound
-        (~1800-4500 Hz) that only plays for the local player's kills.
-        We detect it by measuring onset strength (spectral flux) in that band.
+        Two-pass approach:
+        1. Spectral flux (low threshold) → many candidates (intentionally over-detect)
+        2. Extract audio snippets from top candidates, compute pairwise NCC
+           to find the repeating kill sound pattern (auto-calibration)
+        3. Score ALL candidates against the discovered reference → keep matches
+
+        The kill "ding" is always the same sound effect, so it forms a cluster
+        of similar-sounding events. Other sounds (gunshots, dinks, etc.) are
+        varied and don't cluster.
         """
         with wave.open(str(audio_path), 'rb') as wf:
             rate = wf.getframerate()
@@ -298,24 +318,112 @@ class CS2DataPipeline:
             raw = wf.readframes(n_frames)
 
         audio = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
-        audio /= 32768.0  # normalize to [-1, 1]
+        audio /= 32768.0
 
         if len(audio) == 0:
             return []
 
-        # STFT parameters
+        # Bandpass filter full audio to kill sound frequency range
+        filtered = self._bandpass_filter(audio, rate)
+
+        # ---- Pass 1: Spectral flux candidates (intentionally over-detect) ----
+        candidates = self._spectral_flux_candidates(audio, rate, fps)
+        if not candidates:
+            return []
+
+        logger.info(f"Pass 1: {len(candidates)} spectral flux adayi")
+
+        # If very few candidates, skip fingerprinting
+        if len(candidates) <= 2:
+            return candidates
+
+        # ---- Auto-calibrate: find kill sound reference via pairwise NCC ----
+        snippet_ms = self.config["fingerprint_snippet_ms"]
+        snippet_samples = int(snippet_ms / 1000 * rate)
+        ncc_threshold = self.config["fingerprint_ncc_threshold"]
+        top_n = min(len(candidates), self.config["fingerprint_top_n"])
+
+        # Take top N candidates by flux strength
+        sorted_cands = sorted(candidates, key=lambda x: x["audio_flux"], reverse=True)
+        top_cands = sorted_cands[:top_n]
+
+        # Extract snippets from bandpass-filtered audio
+        snippets = [
+            self._extract_snippet(filtered, rate, c["timestamp"], snippet_samples)
+            for c in top_cands
+        ]
+
+        # Compute pairwise NCC matrix
+        n = len(snippets)
+        ncc_matrix = np.zeros((n, n))
+        for i in range(n):
+            ncc_matrix[i][i] = 1.0
+            for j in range(i + 1, n):
+                ncc = self._compute_ncc(snippets[i], snippets[j])
+                ncc_matrix[i][j] = ncc
+                ncc_matrix[j][i] = ncc
+
+        # Find the snippet with highest average similarity to all others
+        avg_sim = ncc_matrix.mean(axis=1)
+        ref_idx = int(np.argmax(avg_sim))
+        ref_snippet = snippets[ref_idx]
+        ref_avg = float(avg_sim[ref_idx])
+
+        logger.info(f"Reference: idx={ref_idx}, t={top_cands[ref_idx]['timestamp']:.2f}s, "
+                    f"avg_ncc={ref_avg:.3f}")
+
+        # Count how many top candidates match the reference well
+        cluster_count = sum(1 for i in range(n) if ncc_matrix[ref_idx][i] >= ncc_threshold)
+        logger.info(f"Cluster: {cluster_count}/{top_n} benzer aday")
+
+        # If no clear pattern found, fall back to top candidates by flux
+        if ref_avg < 0.15 or cluster_count < 2:
+            logger.warning("Kill sesi patterni bulunamadi, flux adaylari kullaniliyor")
+            return sorted_cands[:5]
+
+        # ---- Pass 2: Score ALL candidates against reference ----
+        final = []
+        for cand in candidates:
+            snippet = self._extract_snippet(filtered, rate, cand["timestamp"], snippet_samples)
+            ncc = self._compute_ncc(ref_snippet, snippet)
+            if ncc >= ncc_threshold:
+                cand["confidence"] = round(float(ncc), 4)
+                cand["ncc_score"] = round(float(ncc), 4)
+                final.append(cand)
+
+        logger.info(f"Pass 2: {len(final)}/{len(candidates)} aday onaylandi (NCC >= {ncc_threshold})")
+
+        return sorted(final, key=lambda x: x["timestamp"])
+
+    def _bandpass_filter(self, audio, rate):
+        """FFT-based bandpass filter to kill sound frequency range."""
+        freq_low = self.config["kill_sound_freq_low"]
+        freq_high = self.config["kill_sound_freq_high"]
+
+        n = len(audio)
+        fft_data = np.fft.rfft(audio)
+        freqs = np.fft.rfftfreq(n, 1.0 / rate)
+
+        # Zero out frequencies outside the kill sound band
+        mask = (freqs >= freq_low) & (freqs <= freq_high)
+        fft_data[~mask] = 0
+
+        return np.fft.irfft(fft_data, n)
+
+    def _spectral_flux_candidates(self, audio, rate, fps):
+        """
+        Pass 1: Spectral flux with low threshold to find all possible candidates.
+        Uses a lower multiplier (2.0) than final detection to intentionally over-detect.
+        """
         win_size = int(self.config["audio_window_ms"] / 1000 * rate)
         hop_size = int(self.config["audio_hop_ms"] / 1000 * rate)
         freq_low = self.config["kill_sound_freq_low"]
         freq_high = self.config["kill_sound_freq_high"]
-        multiplier = self.config["audio_peak_multiplier"]
 
-        # Precompute window and frequency mask
         hann = np.hanning(win_size)
         freqs = np.fft.rfftfreq(win_size, 1.0 / rate)
         band_mask = (freqs >= freq_low) & (freqs <= freq_high)
 
-        # Compute spectral flux in kill sound frequency band
         prev_band = None
         flux_list = []
         time_list = []
@@ -326,7 +434,6 @@ class CS2DataPipeline:
             band = spectrum[band_mask]
 
             if prev_band is not None and len(band) == len(prev_band):
-                # Half-wave rectified spectral flux (onset detection only)
                 flux = np.sum(np.maximum(band - prev_band, 0))
                 flux_list.append(flux)
                 time_list.append(start / rate)
@@ -337,35 +444,64 @@ class CS2DataPipeline:
             return []
 
         flux_arr = np.array(flux_list)
-
-        # Adaptive threshold: median + multiplier * standard deviation
         median_flux = np.median(flux_arr)
         std_flux = np.std(flux_arr)
-        threshold = median_flux + multiplier * std_flux
 
-        logger.info(f"Ses analizi: median={median_flux:.2f}, std={std_flux:.2f}, "
-                     f"threshold={threshold:.2f}")
+        # Lower multiplier (2.0) for over-detection in Pass 1
+        threshold = median_flux + 2.0 * std_flux
 
-        # Peak detection with minimum distance (0.5s between peaks)
-        min_dist = int(0.5 * rate / hop_size)
-        detections = []
+        logger.info(f"Pass 1: median={median_flux:.2f}, std={std_flux:.2f}, "
+                    f"threshold={threshold:.2f}")
+
+        # Peak detection with 0.3s minimum distance
+        min_dist = int(0.3 * rate / hop_size)
+        candidates = []
         last_idx = -min_dist
 
         for i in range(len(flux_arr)):
             if flux_arr[i] > threshold and (i - last_idx) >= min_dist:
                 ts = time_list[i]
-                # Confidence: how far above threshold (0.5 at threshold, 1.0 at 3x)
-                conf = min((flux_arr[i] / threshold - 1) / 2 + 0.5, 1.0)
-                detections.append({
+                candidates.append({
                     "timestamp": round(ts, 2),
                     "frame_number": int(ts * fps),
-                    "confidence": round(conf, 4),
+                    "confidence": 0.5,
                     "audio_flux": round(float(flux_arr[i]), 4),
                     "detection_method": "audio",
                 })
                 last_idx = i
 
-        return detections
+        return candidates
+
+    def _extract_snippet(self, filtered_audio, rate, timestamp, snippet_samples):
+        """Extract an audio snippet centered on the given timestamp."""
+        center = int(timestamp * rate)
+        half = snippet_samples // 2
+        start = max(0, center - half)
+        end = min(len(filtered_audio), start + snippet_samples)
+        start = max(0, end - snippet_samples)
+
+        snippet = filtered_audio[start:end]
+
+        # Pad with zeros if near audio boundaries
+        if len(snippet) < snippet_samples:
+            padded = np.zeros(snippet_samples)
+            padded[:len(snippet)] = snippet
+            snippet = padded
+
+        return snippet
+
+    def _compute_ncc(self, a, b):
+        """Compute Normalized Cross-Correlation between two audio snippets."""
+        a = a - np.mean(a)
+        b = b - np.mean(b)
+
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+
+        if norm_a < 1e-10 or norm_b < 1e-10:
+            return 0.0
+
+        return float(np.dot(a, b) / (norm_a * norm_b))
 
     # -------------------------------------------------------------------------
     # Visual kill detection (fallback)
@@ -563,7 +699,7 @@ class CS2DataPipeline:
         metadata = {
             "session_id": session_id,
             "created_at": datetime.now().isoformat(),
-            "pipeline_version": "2.2.0",
+            "pipeline_version": "3.0.0",
             "source": {
                 "url": url,
                 "platform": "medal.tv",
@@ -574,7 +710,7 @@ class CS2DataPipeline:
                 "file_size_bytes": file_size,
             },
             "detection_config": {
-                "method": "audio+visual_crossvalidation",
+                "method": "audio_fingerprint+visual_crossvalidation",
                 "roi": {
                     "x_start_ratio": self.config["roi_x_start_ratio"],
                     "x_end_ratio": self.config["roi_x_end_ratio"],
@@ -587,6 +723,8 @@ class CS2DataPipeline:
                     self.config["kill_sound_freq_low"],
                     self.config["kill_sound_freq_high"],
                 ],
+                "fingerprint_snippet_ms": self.config["fingerprint_snippet_ms"],
+                "fingerprint_ncc_threshold": self.config["fingerprint_ncc_threshold"],
                 "diff_threshold": self.config["diff_threshold"],
                 "diff_noise_threshold": self.config["diff_noise_threshold"],
             },
@@ -608,6 +746,7 @@ class CS2DataPipeline:
                 "confidence": det["confidence"],
                 "detection_method": det.get("detection_method", "unknown"),
                 "audio_flux": det.get("audio_flux"),
+                "ncc_score": det.get("ncc_score"),
                 "roi_change": det.get("roi_change"),
                 "global_change": det.get("global_change"),
                 "clip_file": det.get("clip_file", ""),
