@@ -31,17 +31,20 @@ DEFAULT_CONFIG = {
     "frame_skip": 6,
     "cooldown_seconds": 1.0,
 
-    # Audio kill sound detection (primary method)
+    # Audio kill sound detection
     "kill_sound_freq_low": 1800,
     "kill_sound_freq_high": 4500,
-    "audio_peak_multiplier": 2.5,
+    "audio_peak_multiplier": 3.5,
     "audio_window_ms": 50,
     "audio_hop_ms": 10,
 
-    # Visual detection fallback
+    # Visual kill feed detection
     "diff_threshold": 0.03,
     "diff_noise_threshold": 30,
     "global_scale_factor": 0.25,
+
+    # Cross-validation
+    "cross_validate_window": 1.0,
 
     # Clip Extraction
     "clip_pre_seconds": 3.0,
@@ -149,8 +152,15 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect personal kills using audio kill sound analysis.
-        Falls back to visual kill feed detection if audio is unavailable.
+        Detect personal kills using audio + visual cross-validation.
+
+        1. Visual: scan kill feed ROI for ANY kill events (timestamps)
+        2. Audio: scan for the player's kill confirmation sound (timestamps)
+        3. Cross-validate: keep only kills confirmed by BOTH signals (±1s)
+           - Audio spike without kill feed change → false positive (gunshot etc.)
+           - Kill feed change without audio → someone else's kill
+           - Both together → YOUR kill
+        Falls back to visual-only if audio is unavailable.
         """
         if progress_callback:
             progress_callback("detecting", "Kill anlari tespit ediliyor...")
@@ -170,35 +180,79 @@ class CS2DataPipeline:
 
         logger.info(f"Video: {width}x{height}, {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
 
-        # Primary: Audio-based detection (personal kills only)
-        raw_detections = None
-        audio_path = self._extract_audio(video_path)
+        # Step 1: Visual detection — find ALL kill feed events
+        visual_dets = self._detect_kills_visual(
+            video_path, fps, total_frames, width, height, progress_callback
+        )
+        logger.info(f"Gorsel: {len(visual_dets)} kill feed olayı")
 
+        # Step 2: Audio detection — find personal kill sounds
+        audio_dets = []
+        audio_path = self._extract_audio(video_path)
         if audio_path:
             try:
-                raw_detections = self._detect_kill_sounds(audio_path, fps)
-                if raw_detections:
-                    logger.info(f"Ses analizi: {len(raw_detections)} kisisel kill sesi tespit edildi")
-                else:
-                    logger.info("Ses analizi: kill sesi bulunamadi, gorsel tespite geciliyor")
-                    raw_detections = None
+                audio_dets = self._detect_kill_sounds(audio_path, fps)
+                logger.info(f"Ses: {len(audio_dets)} aday kill sesi")
             except Exception as e:
                 logger.warning(f"Ses analizi basarisiz: {e}")
             finally:
                 audio_path.unlink(missing_ok=True)
 
-        # Fallback: Visual detection (detects all kill feed activity)
-        if raw_detections is None:
-            logger.info("Gorsel tespit kullaniliyor (kill feed ROI)")
-            raw_detections = self._detect_kills_visual(
-                video_path, fps, total_frames, width, height, progress_callback
-            )
+        # Step 3: Cross-validate or fallback
+        if audio_dets and visual_dets:
+            raw_detections = self._cross_validate(audio_dets, visual_dets)
+            logger.info(f"Cross-validation: {len(raw_detections)} onaylanmis kill")
+            if not raw_detections:
+                logger.warning("Cross-validation sonucu bos, gorsel tespite donuluyor")
+                raw_detections = visual_dets
+        elif visual_dets:
+            logger.info("Ses bulunamadi, gorsel tespit kullaniliyor")
+            raw_detections = visual_dets
+        else:
+            raw_detections = audio_dets
 
         detections = self._apply_cooldown(raw_detections)
 
-        logger.info(f"Tespit tamamlandi: {len(raw_detections)} ham, "
-                     f"{len(detections)} filtrelenmis kill")
+        logger.info(f"Tespit tamamlandi: {len(detections)} kill")
         return detections
+
+    def _cross_validate(self, audio_dets, visual_dets, window=None):
+        """
+        Keep only audio detections that have a matching visual confirmation
+        within ±window seconds. Merges metadata from both sources.
+        """
+        if window is None:
+            window = self.config["cross_validate_window"]
+
+        validated = []
+        used_visual = set()
+
+        for audio_det in audio_dets:
+            best_match = None
+            best_dist = window + 1
+
+            for j, visual_det in enumerate(visual_dets):
+                if j in used_visual:
+                    continue
+                dist = abs(audio_det["timestamp"] - visual_det["timestamp"])
+                if dist <= window and dist < best_dist:
+                    best_match = j
+                    best_dist = dist
+
+            if best_match is not None:
+                used_visual.add(best_match)
+                v = visual_dets[best_match]
+                validated.append({
+                    "timestamp": audio_det["timestamp"],
+                    "frame_number": audio_det["frame_number"],
+                    "confidence": round((audio_det["confidence"] + v["confidence"]) / 2, 4),
+                    "audio_flux": audio_det.get("audio_flux"),
+                    "roi_change": v.get("roi_change"),
+                    "global_change": v.get("global_change"),
+                    "detection_method": "audio+visual",
+                })
+
+        return validated
 
     # -------------------------------------------------------------------------
     # Audio kill detection
@@ -509,7 +563,7 @@ class CS2DataPipeline:
         metadata = {
             "session_id": session_id,
             "created_at": datetime.now().isoformat(),
-            "pipeline_version": "2.1.0",
+            "pipeline_version": "2.2.0",
             "source": {
                 "url": url,
                 "platform": "medal.tv",
@@ -520,7 +574,7 @@ class CS2DataPipeline:
                 "file_size_bytes": file_size,
             },
             "detection_config": {
-                "method": "audio+visual_fallback",
+                "method": "audio+visual_crossvalidation",
                 "roi": {
                     "x_start_ratio": self.config["roi_x_start_ratio"],
                     "x_end_ratio": self.config["roi_x_end_ratio"],
