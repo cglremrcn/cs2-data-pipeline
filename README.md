@@ -37,13 +37,15 @@ Open `http://localhost:5000` in your browser. Paste a Medal.tv URL and click "Ba
 - Two-pass approach: spectral flux candidates → audio fingerprint matching
 - Pass 1: Detects all audio onset candidates in the 1800-4500 Hz band (over-detects intentionally)
 - Auto-calibration: Extracts audio snippets from top candidates, computes pairwise Normalized Cross-Correlation (NCC), identifies the repeating kill sound pattern automatically
-- Pass 2: Scores all candidates against the discovered reference — only matching sounds (NCC ≥ 0.4) are kept
+- Pass 2: Scores all candidates against the discovered reference — only matching sounds (NCC ≥ 0.3) are kept
 - No manual template needed — the kill sound is discovered from the clip itself
 
-**Cross-validation with visual detection**
-- Kill feed ROI (top-right 30%) monitored via frame differencing
-- Audio fingerprint results validated against visual kill feed activity
-- If cross-validation is too aggressive, fingerprint results are trusted alone
+**Kill feed verification** (eliminates false positives)
+- CS2 kill feed entries have dark semi-transparent background bars
+- Each audio candidate is verified by checking if dark bars are visible in the kill feed ROI
+- Dark pixel ratio (brightness < 60) measured at multiple time offsets around each candidate
+- Real kills show dark_ratio > 0.25, false positives (empty ROI) show ~0.0
+- Only candidates with confirmed kill feed presence are kept
 
 **Fallback: Visual frame differencing** (all kill feed activity)
 - Used when audio is unavailable (no audio track, extraction failure)
