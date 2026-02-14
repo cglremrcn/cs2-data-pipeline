@@ -213,7 +213,7 @@ class CS2DataPipeline:
         try:
             subprocess.run(cmd, capture_output=True, check=True, timeout=30)
             if audio_path.exists() and audio_path.stat().st_size > 1000:
-                logger.info(f"Ses cikarildi: {audio_path.name}")
+                logger.info(f"Audio extracted: {audio_path.name}")
                 return audio_path
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning(f"Audio extraction failed: {e}")
@@ -256,7 +256,7 @@ class CS2DataPipeline:
         if not candidates:
             return [], []
 
-        logger.info(f"Pass 1: {len(candidates)} spectral flux adayi")
+        logger.info(f"Pass 1: {len(candidates)} spectral flux candidates")
 
         # If very few candidates, skip fingerprinting
         if len(candidates) <= 2:
@@ -470,60 +470,77 @@ class CS2DataPipeline:
 
     def _verify_kill_feed(self, video_path, audio_dets, fps, width, height):
         """
-        Verify audio candidates by checking if kill feed entries are visible.
+        Verify audio candidates by detecting NEW kill feed entries in the ROI.
 
-        CS2 kill feed entries have dark semi-transparent background bars.
-        We measure the ratio of dark pixels (brightness < 60) in the kill feed
-        ROI at each candidate's timestamp. Real kills have dark_ratio > 0.25,
-        false positives (empty ROI) have dark_ratio near 0.
+        Compares dark_ratio at candidate time vs 2s before (baseline).
+        Kill feed entries are semi-transparent dark overlays — when a new entry
+        appears, the dark pixel ratio in the ROI increases noticeably.
 
-        Checks at offsets [-0.5, 0, +0.5, +1.0] seconds from each candidate
-        and keeps the candidate if ANY offset shows dark_ratio > 0.25.
+        This rejects:
+          - Audio matches in dark environments (tunnels, shadows) where the
+            game world is already dark but no kill feed is present
+          - Timestamps where kill feed shows old entries from other players'
+            kills (no change in dark_ratio = no new entry)
         """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             logger.warning("Cannot open video for kill feed verification")
-            return audio_dets  # Can't verify, return all
+            return audio_dets
 
-        # Calculate ROI pixel coordinates
         roi_x1 = int(width * self.config["roi_x_start_ratio"])
         roi_x2 = int(width * self.config["roi_x_end_ratio"])
         roi_y1 = int(height * self.config["roi_y_start_ratio"])
         roi_y2 = int(height * self.config["roi_y_end_ratio"])
 
-        dark_threshold = 60    # Pixel brightness threshold
-        ratio_threshold = 0.25  # Min dark pixel ratio to confirm kill feed
-        offsets = [-0.5, 0.0, 0.5, 1.0]  # Seconds relative to candidate
+        def get_dark_ratio(timestamp):
+            """Get fraction of dark pixels (<60) in the ROI at given timestamp."""
+            frame_num = int(timestamp * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            if not ret:
+                return 0.0
+            gray = cv2.cvtColor(
+                frame[roi_y1:roi_y2, roi_x1:roi_x2], cv2.COLOR_BGR2GRAY
+            )
+            return np.count_nonzero(gray < 60) / gray.size
 
         verified = []
 
         for det in audio_dets:
             ts = det["timestamp"]
-            max_dark_ratio = 0.0
 
-            for offset in offsets:
-                check_ts = ts + offset
-                if check_ts < 0:
-                    continue
+            # Baseline: 2s before candidate
+            baseline_dark = get_dark_ratio(max(0, ts - 2.0))
 
-                frame_num = int(check_ts * fps)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame = cap.read()
-                if not ret:
-                    continue
+            # Peak dark_ratio at candidate time (check 0, +0.5, +1.0s)
+            best_dark = max(get_dark_ratio(ts + off) for off in [0.0, 0.5, 1.0])
 
-                roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                dark_ratio = np.count_nonzero(gray < dark_threshold) / gray.size
-                max_dark_ratio = max(max_dark_ratio, dark_ratio)
+            delta = best_dark - baseline_dark
 
-            if max_dark_ratio > ratio_threshold:
-                det["dark_ratio"] = round(max_dark_ratio, 4)
+            # Adaptive threshold: when baseline is already dark, require a larger
+            # delta to avoid false positives from game world lighting changes.
+            # Bright baseline (0.0) → threshold ~0.05 (sensitive)
+            # Dark baseline (0.9) → threshold ~0.14 (strict)
+            delta_threshold = 0.05 + baseline_dark * 0.10
+
+            # Confirm if:
+            #   - Scene was bright, now has dark kill feed overlay
+            #   - OR dark_ratio jumped above the adaptive threshold
+            confirmed = (
+                (baseline_dark < 0.20 and best_dark > 0.25)
+                or delta > delta_threshold
+            )
+
+            if confirmed:
+                det["dark_ratio"] = round(best_dark, 4)
+                det["dark_ratio_delta"] = round(delta, 4)
                 det["detection_method"] = "audio+killfeed"
                 verified.append(det)
-                logger.info(f"  Onaylandi: t={ts:.2f}s, dark_ratio={max_dark_ratio:.3f}")
+                logger.info(f"  Confirmed: t={ts:.2f}s, dark={best_dark:.3f}, "
+                            f"delta={delta:+.3f}, base={baseline_dark:.3f}")
             else:
-                logger.info(f"  Reddedildi: t={ts:.2f}s, dark_ratio={max_dark_ratio:.3f}")
+                logger.info(f"  Rejected: t={ts:.2f}s, dark={best_dark:.3f}, "
+                            f"delta={delta:+.3f}, base={baseline_dark:.3f}")
 
         cap.release()
         return verified
