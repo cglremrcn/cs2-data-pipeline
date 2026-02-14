@@ -156,13 +156,14 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect personal kills using audio fingerprinting + kill feed verification.
+        Detect personal kills using audio fingerprinting + kill feed verification,
+        supplemented by kill feed onset scanning to catch kills audio missed.
 
         1. Audio: two-pass NCC fingerprinting to find kill sound candidates
-        2. Visual verification: check if kill feed entries (dark bars) are
-           visible at each candidate's timestamp — rejects false positives
-           where no kill feed is showing
-        Falls back to visual-only if audio is unavailable.
+        2. Kill feed verification: reject audio candidates without visible dark bars
+        3. Kill feed onset scan: detect dark bar appearances throughout the video
+        4. Merge: add onset detections not already covered by audio
+        Falls back to kill feed onset only if audio is unavailable.
         """
         if progress_callback:
             progress_callback("detecting", "Kill anlari tespit ediliyor...")
@@ -194,21 +195,36 @@ class CS2DataPipeline:
             finally:
                 audio_path.unlink(missing_ok=True)
 
+        # Step 2: Kill feed onset scan — detect all dark bar appearances
+        onset_dets = self._detect_killfeed_onsets(
+            video_path, fps, total_frames, width, height, progress_callback
+        )
+        logger.info(f"Kill feed onset: {len(onset_dets)} olay")
+
         if not audio_dets:
-            # Fallback: visual-only detection
-            logger.info("Ses bulunamadi, gorsel tespit kullaniliyor")
-            visual_dets = self._detect_kills_visual(
-                video_path, fps, total_frames, width, height, progress_callback
-            )
-            detections = self._apply_cooldown(visual_dets)
-            logger.info(f"Tespit tamamlandi: {len(detections)} kill (gorsel)")
+            # Audio unavailable — use onset detections only
+            detections = self._apply_cooldown(onset_dets)
+            logger.info(f"Tespit tamamlandi: {len(detections)} kill (onset)")
             return detections
 
-        # Step 2: Verify each audio candidate — is kill feed visible?
+        # Step 3: Verify audio candidates against kill feed
         verified = self._verify_kill_feed(video_path, audio_dets, fps, width, height)
         logger.info(f"Kill feed dogrulama: {len(verified)}/{len(audio_dets)} onaylandi")
 
-        detections = self._apply_cooldown(verified)
+        # Step 4: Merge — add onset detections not covered by audio
+        merge_window = self.config["cooldown_seconds"]
+        merged = list(verified)
+        for onset in onset_dets:
+            already_covered = any(
+                abs(onset["timestamp"] - v["timestamp"]) < merge_window
+                for v in verified
+            )
+            if not already_covered:
+                merged.append(onset)
+                logger.info(f"  Onset eklendi: t={onset['timestamp']:.2f}s (ses tarafindan kacirildi)")
+
+        merged.sort(key=lambda x: x["timestamp"])
+        detections = self._apply_cooldown(merged)
 
         logger.info(f"Tespit tamamlandi: {len(detections)} kill")
         return detections
@@ -583,6 +599,82 @@ class CS2DataPipeline:
 
         cap.release()
         return verified
+
+    # -------------------------------------------------------------------------
+    # Kill feed onset detection (dark bar scanning)
+    # -------------------------------------------------------------------------
+
+    def _detect_killfeed_onsets(self, video_path, fps, total_frames, width, height,
+                                progress_callback=None):
+        """
+        Scan video for kill feed dark bar onsets (rising edges).
+
+        Tracks dark_ratio in the kill feed ROI over time and detects when it
+        transitions from below threshold to above — indicating a new kill feed
+        entry appeared. This catches kills that audio fingerprinting missed.
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return []
+
+        roi_x1 = int(width * self.config["roi_x_start_ratio"])
+        roi_x2 = int(width * self.config["roi_x_end_ratio"])
+        roi_y1 = int(height * self.config["roi_y_start_ratio"])
+        roi_y2 = int(height * self.config["roi_y_end_ratio"])
+
+        dark_threshold = 60
+        onset_threshold = 0.25
+        # Minimum increase in dark_ratio to count as a new entry
+        rise_threshold = 0.10
+        frame_skip = self.config["frame_skip"]
+        cooldown_frames = int(self.config["cooldown_seconds"] * fps)
+
+        detections = []
+        frame_number = 0
+        prev_dark_ratio = 0.0
+        last_detection_frame = -cooldown_frames
+        analyzed = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_number % frame_skip == 0:
+                roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                dark_ratio = np.count_nonzero(gray < dark_threshold) / gray.size
+
+                # Detect rising edge: dark_ratio crosses above threshold
+                # AND increased significantly from previous sample
+                is_onset = (
+                    dark_ratio > onset_threshold
+                    and (prev_dark_ratio < onset_threshold or dark_ratio - prev_dark_ratio > rise_threshold)
+                    and (frame_number - last_detection_frame) >= cooldown_frames
+                )
+
+                if is_onset:
+                    timestamp = frame_number / fps
+                    detections.append({
+                        "timestamp": round(timestamp, 2),
+                        "frame_number": frame_number,
+                        "confidence": round(min(dark_ratio, 1.0), 4),
+                        "dark_ratio": round(dark_ratio, 4),
+                        "detection_method": "killfeed_onset",
+                    })
+                    last_detection_frame = frame_number
+
+                prev_dark_ratio = dark_ratio
+                analyzed += 1
+
+                if analyzed % 100 == 0 and progress_callback:
+                    pct = int((frame_number / total_frames) * 100)
+                    logger.info(f"Onset tarama: {pct}% ({analyzed} kare)")
+
+            frame_number += 1
+
+        cap.release()
+        return detections
 
     # -------------------------------------------------------------------------
     # Visual kill detection (fallback)
