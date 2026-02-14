@@ -4,7 +4,6 @@ CS2 Data Pipeline - Flask Web Interface
 
 import json
 import threading
-import uuid
 from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, send_from_directory
@@ -20,21 +19,11 @@ pipeline = CS2DataPipeline(base_dir=BASE_DIR)
 pipeline_status = {}
 pipeline_results = {}
 
-# Store template creation jobs
-template_jobs = {}
-
-
-def to_url_path(p):
-    """Convert a Path to a forward-slash URL-safe string."""
-    return str(p).replace("\\", "/")
-
 
 @app.route("/")
 def index():
     """Main page."""
-    # Check if template exists
-    template_exists = (BASE_DIR / pipeline.config["templates_dir"] / pipeline.config["template_file"]).exists()
-    return render_template("index.html", template_exists=template_exists)
+    return render_template("index.html")
 
 
 @app.route("/api/process", methods=["POST"])
@@ -45,11 +34,6 @@ def process_video():
 
     if not url:
         return jsonify({"error": "URL gerekli"}), 400
-
-    # Check template
-    template_path = BASE_DIR / pipeline.config["templates_dir"] / pipeline.config["template_file"]
-    if not template_path.exists():
-        return jsonify({"error": "Template bulunamadi. Once template olusturun."}), 400
 
     # Generate session id
     from datetime import datetime
@@ -90,86 +74,6 @@ def get_status(session_id):
     })
 
 
-@app.route("/api/template/create", methods=["POST"])
-def create_template():
-    """Extract frames from a video for template creation (async)."""
-    data = request.get_json()
-    url = data.get("url", "").strip()
-
-    if not url:
-        return jsonify({"error": "URL gerekli"}), 400
-
-    job_id = str(uuid.uuid4())[:8]
-    template_jobs[job_id] = {"status": "downloading", "message": "Video indiriliyor..."}
-
-    def run_template_job():
-        try:
-            template_jobs[job_id] = {"status": "downloading", "message": "Video indiriliyor..."}
-            video_path = pipeline.download_video(url)
-
-            template_jobs[job_id] = {"status": "extracting", "message": "Kareler cikariliyor..."}
-            frames = pipeline.extract_frames_for_template(video_path, count=15)
-
-            template_jobs[job_id] = {
-                "status": "done",
-                "message": "Tamamlandi",
-                "frames": [to_url_path(Path(f).relative_to(BASE_DIR)) for f in frames],
-                "video_path": to_url_path(video_path.relative_to(BASE_DIR)),
-            }
-        except Exception as e:
-            template_jobs[job_id] = {"status": "error", "message": str(e)}
-
-    thread = threading.Thread(target=run_template_job, daemon=True)
-    thread.start()
-
-    return jsonify({"job_id": job_id, "status": "started"})
-
-
-@app.route("/api/template/status/<job_id>")
-def template_status(job_id):
-    """Get template creation job status."""
-    job = template_jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job bulunamadi"}), 404
-    return jsonify(job)
-
-
-@app.route("/api/template/save", methods=["POST"])
-def save_template():
-    """Save a cropped region as the kill template."""
-    data = request.get_json()
-    frame_path = data.get("frame_path", "")
-    crop = data.get("crop", {})
-
-    x = int(crop.get("x", 0))
-    y = int(crop.get("y", 0))
-    w = int(crop.get("w", 0))
-    h = int(crop.get("h", 0))
-
-    if not frame_path or w == 0 or h == 0:
-        return jsonify({"error": "Gecersiz parametreler"}), 400
-
-    try:
-        import cv2
-        full_path = BASE_DIR / frame_path
-        frame = cv2.imread(str(full_path))
-        if frame is None:
-            return jsonify({"error": "Kare okunamadi"}), 400
-
-        cropped = frame[y:y + h, x:x + w]
-        template_dir = BASE_DIR / pipeline.config["templates_dir"]
-        template_dir.mkdir(parents=True, exist_ok=True)
-        template_path = template_dir / pipeline.config["template_file"]
-        cv2.imwrite(str(template_path), cropped)
-
-        # Reload template
-        pipeline._load_template()
-
-        return jsonify({"status": "ok", "size": f"{w}x{h}"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/api/sessions")
 def list_sessions():
     """List all previous sessions from metadata files."""
@@ -190,12 +94,6 @@ def list_sessions():
             except (json.JSONDecodeError, KeyError):
                 continue
     return jsonify(sessions)
-
-
-@app.route("/frames/<path:filename>")
-def serve_frame(filename):
-    """Serve extracted frame images."""
-    return send_from_directory(str(BASE_DIR / "frames"), filename)
 
 
 @app.route("/clips/<path:filename>")
