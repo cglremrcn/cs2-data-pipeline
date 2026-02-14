@@ -39,7 +39,7 @@ def process_video():
     from datetime import datetime
     session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    pipeline_status[session_id] = {"phase": "queued", "message": "Kuyrukta..."}
+    pipeline_status[session_id] = {"phase": "queued", "message": "Queued..."}
     pipeline_results[session_id] = None
 
     def run_pipeline():
