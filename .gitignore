@@ -1,9 +1,11 @@
 # Video and media files
 downloads/
 clips/
+debug_frames/
 *.mp4
 *.avi
 *.mkv
+*.wav
 
 # Metadata output
 metadata/
