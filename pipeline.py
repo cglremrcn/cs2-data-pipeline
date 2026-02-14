@@ -38,8 +38,8 @@ DEFAULT_CONFIG = {
     "audio_hop_ms": 10,
 
     # Visual kill feed detection
-    "diff_threshold": 0.08,
-    "diff_noise_threshold": 40,
+    "diff_threshold": 0.05,
+    "diff_noise_threshold": 30,
     "global_scale_factor": 0.25,
 
     # Cross-validation
@@ -207,14 +207,9 @@ class CS2DataPipeline:
             raw_detections = self._cross_validate(audio_dets, visual_dets)
             logger.info(f"Cross-validation: {len(raw_detections)} onaylanmis kill")
 
-            # If cross-validation removed too many fingerprinted results,
-            # trust the fingerprinting (it's already filtered by NCC)
+            # Only fall back to audio alone if cross-validation gives ZERO
             if not raw_detections:
                 logger.warning("Cross-validation bos, fingerprint sonuclari kullaniliyor")
-                raw_detections = audio_dets
-            elif len(raw_detections) < len(audio_dets) * 0.4:
-                logger.warning(f"Cross-validation cok fazla sildi ({len(raw_detections)}/{len(audio_dets)}), "
-                              f"fingerprint sonuclari kullaniliyor")
                 raw_detections = audio_dets
         elif audio_dets:
             logger.info("Gorsel tespit bos, fingerprint sonuclari kullaniliyor")
@@ -591,7 +586,7 @@ class CS2DataPipeline:
                     global_diff[global_diff < noise_threshold] = 0
                     global_change = np.count_nonzero(global_diff) / global_diff.size
 
-                    if roi_change >= diff_threshold and roi_change > global_change * 3:
+                    if roi_change >= diff_threshold and roi_change > global_change * 2:
                         timestamp = frame_number / fps
                         confidence = min(roi_change / diff_threshold, 1.0)
                         raw_detections.append({
