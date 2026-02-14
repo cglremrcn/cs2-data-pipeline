@@ -632,7 +632,7 @@ class CS2DataPipeline:
                 logger.info(f"[3/4] {len(detections)} klip kesiliyor...")
                 clip_paths = self.cut_clips(video_path, detections, session_id, progress_callback)
                 result["clips_created"] = len(clip_paths)
-                result["clip_paths"] = [str(p.relative_to(self.base_dir)) for p in clip_paths]
+                result["clip_paths"] = [str(p.relative_to(self.base_dir)).replace("\\", "/") for p in clip_paths]
 
                 # Phase 4: Metadata
                 logger.info("[4/4] Metadata olusturuluyor...")
@@ -641,7 +641,7 @@ class CS2DataPipeline:
                 meta_path = self.generate_metadata(
                     video_path, url, detections, clip_paths, session_id
                 )
-                result["metadata_path"] = str(meta_path.relative_to(self.base_dir))
+                result["metadata_path"] = str(meta_path.relative_to(self.base_dir)).replace("\\", "/")
                 result["status"] = "completed"
 
             elapsed = time.time() - start_time

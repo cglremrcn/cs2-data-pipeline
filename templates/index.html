@@ -301,7 +301,7 @@
             const btn = document.getElementById('templateExtractBtn');
             btn.disabled = true;
             btn.textContent = 'Indiriliyor...';
-            document.getElementById('templateStatus').textContent = 'Video indiriliyor ve kareler cikariliyor...';
+            document.getElementById('templateStatus').textContent = 'Video indiriliyor...';
 
             fetch('/api/template/create', {
                 method: 'POST',
@@ -310,33 +310,67 @@
             })
             .then(r => r.json())
             .then(data => {
-                btn.disabled = false;
-                btn.textContent = 'Kareleri Cikar';
-
                 if (data.error) {
+                    btn.disabled = false;
+                    btn.textContent = 'Kareleri Cikar';
                     document.getElementById('templateStatus').textContent = 'Hata: ' + data.error;
                     return;
                 }
-
-                document.getElementById('templateStatus').textContent =
-                    `${data.frames.length} kare cikarildi. Kill iceren bir kareye tiklayin.`;
-
-                const grid = document.getElementById('framesGrid');
-                grid.innerHTML = '';
-
-                data.frames.forEach(framePath => {
-                    const div = document.createElement('div');
-                    div.className = 'frame-item';
-                    div.innerHTML = `<img src="/${framePath}" alt="frame">`;
-                    div.onclick = () => selectFrame(framePath, div);
-                    grid.appendChild(div);
-                });
+                // Start polling for job status
+                pollTemplateJob(data.job_id);
             })
             .catch(err => {
                 btn.disabled = false;
                 btn.textContent = 'Kareleri Cikar';
                 document.getElementById('templateStatus').textContent = 'Hata: ' + err.message;
             });
+        }
+
+        function pollTemplateJob(jobId) {
+            const btn = document.getElementById('templateExtractBtn');
+            const statusEl = document.getElementById('templateStatus');
+
+            const interval = setInterval(() => {
+                fetch(`/api/template/status/${jobId}`)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'downloading') {
+                        statusEl.textContent = 'Video indiriliyor...';
+                        btn.textContent = 'Indiriliyor...';
+                    } else if (data.status === 'extracting') {
+                        statusEl.textContent = 'Kareler cikariliyor...';
+                        btn.textContent = 'Cikariliyor...';
+                    } else if (data.status === 'done') {
+                        clearInterval(interval);
+                        btn.disabled = false;
+                        btn.textContent = 'Kareleri Cikar';
+                        statusEl.textContent =
+                            `${data.frames.length} kare cikarildi. Kill iceren bir kareye tiklayin.`;
+
+                        const grid = document.getElementById('framesGrid');
+                        grid.innerHTML = '';
+
+                        data.frames.forEach(framePath => {
+                            const div = document.createElement('div');
+                            div.className = 'frame-item';
+                            div.innerHTML = `<img src="/${framePath}" alt="frame">`;
+                            div.onclick = () => selectFrame(framePath, div);
+                            grid.appendChild(div);
+                        });
+                    } else if (data.status === 'error') {
+                        clearInterval(interval);
+                        btn.disabled = false;
+                        btn.textContent = 'Kareleri Cikar';
+                        statusEl.textContent = 'Hata: ' + data.message;
+                    }
+                })
+                .catch(() => {
+                    clearInterval(interval);
+                    btn.disabled = false;
+                    btn.textContent = 'Kareleri Cikar';
+                    statusEl.textContent = 'Baglanti hatasi.';
+                });
+            }, 1500);
         }
 
         function selectFrame(framePath, el) {

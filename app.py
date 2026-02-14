@@ -4,6 +4,7 @@ CS2 Data Pipeline - Flask Web Interface
 
 import json
 import threading
+import uuid
 from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, send_from_directory
@@ -18,6 +19,14 @@ pipeline = CS2DataPipeline(base_dir=BASE_DIR)
 # Store pipeline status per session
 pipeline_status = {}
 pipeline_results = {}
+
+# Store template creation jobs
+template_jobs = {}
+
+
+def to_url_path(p):
+    """Convert a Path to a forward-slash URL-safe string."""
+    return str(p).replace("\\", "/")
 
 
 @app.route("/")
@@ -83,23 +92,46 @@ def get_status(session_id):
 
 @app.route("/api/template/create", methods=["POST"])
 def create_template():
-    """Extract frames from a video for template creation."""
+    """Extract frames from a video for template creation (async)."""
     data = request.get_json()
     url = data.get("url", "").strip()
 
     if not url:
         return jsonify({"error": "URL gerekli"}), 400
 
-    try:
-        video_path = pipeline.download_video(url)
-        frames = pipeline.extract_frames_for_template(video_path, count=15)
-        return jsonify({
-            "status": "ok",
-            "frames": [str(Path(f).relative_to(BASE_DIR)) for f in frames],
-            "video_path": str(video_path.relative_to(BASE_DIR)),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    job_id = str(uuid.uuid4())[:8]
+    template_jobs[job_id] = {"status": "downloading", "message": "Video indiriliyor..."}
+
+    def run_template_job():
+        try:
+            template_jobs[job_id] = {"status": "downloading", "message": "Video indiriliyor..."}
+            video_path = pipeline.download_video(url)
+
+            template_jobs[job_id] = {"status": "extracting", "message": "Kareler cikariliyor..."}
+            frames = pipeline.extract_frames_for_template(video_path, count=15)
+
+            template_jobs[job_id] = {
+                "status": "done",
+                "message": "Tamamlandi",
+                "frames": [to_url_path(Path(f).relative_to(BASE_DIR)) for f in frames],
+                "video_path": to_url_path(video_path.relative_to(BASE_DIR)),
+            }
+        except Exception as e:
+            template_jobs[job_id] = {"status": "error", "message": str(e)}
+
+    thread = threading.Thread(target=run_template_job, daemon=True)
+    thread.start()
+
+    return jsonify({"job_id": job_id, "status": "started"})
+
+
+@app.route("/api/template/status/<job_id>")
+def template_status(job_id):
+    """Get template creation job status."""
+    job = template_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job bulunamadi"}), 404
+    return jsonify(job)
 
 
 @app.route("/api/template/save", methods=["POST"])
