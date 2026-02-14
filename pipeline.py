@@ -28,7 +28,6 @@ DEFAULT_CONFIG = {
     "roi_y_end_ratio": 0.185,
 
     # Detection
-    "frame_skip": 6,
     "cooldown_seconds": 1.0,
 
     # Audio kill sound detection
@@ -37,22 +36,12 @@ DEFAULT_CONFIG = {
     "audio_window_ms": 50,
     "audio_hop_ms": 10,
 
-    # Visual kill feed detection
-    "diff_threshold": 0.05,
-    "diff_noise_threshold": 30,
-    "global_scale_factor": 0.25,
-
-    # Cross-validation
-    "cross_validate_window": 1.0,
-
     # Audio fingerprinting (auto-calibration)
     "fingerprint_snippet_ms": 250,
     "fingerprint_ncc_threshold": 0.28,
     "fingerprint_top_n": 15,
 
-    # Clip Extraction
-    "clip_pre_seconds": 2.0,
-    "clip_post_seconds": 2.0,
+    # Output
     "clips_dir": "clips",
 
     # Metadata
@@ -203,45 +192,6 @@ class CS2DataPipeline:
 
         logger.info(f"Tespit tamamlandi: {len(detections)} kill")
         return detections
-
-    def _cross_validate(self, audio_dets, visual_dets, window=None):
-        """
-        Keep only audio detections that have a matching visual confirmation
-        within ±window seconds. Merges metadata from both sources.
-        """
-        if window is None:
-            window = self.config["cross_validate_window"]
-
-        validated = []
-        used_visual = set()
-
-        for audio_det in audio_dets:
-            best_match = None
-            best_dist = window + 1
-
-            for j, visual_det in enumerate(visual_dets):
-                if j in used_visual:
-                    continue
-                dist = abs(audio_det["timestamp"] - visual_det["timestamp"])
-                if dist <= window and dist < best_dist:
-                    best_match = j
-                    best_dist = dist
-
-            if best_match is not None:
-                used_visual.add(best_match)
-                v = visual_dets[best_match]
-                validated.append({
-                    "timestamp": audio_det["timestamp"],
-                    "frame_number": audio_det["frame_number"],
-                    "confidence": round((audio_det["confidence"] + v["confidence"]) / 2, 4),
-                    "audio_flux": audio_det.get("audio_flux"),
-                    "ncc_score": audio_det.get("ncc_score"),
-                    "roi_change": v.get("roi_change"),
-                    "global_change": v.get("global_change"),
-                    "detection_method": "audio+visual",
-                })
-
-        return validated
 
     # -------------------------------------------------------------------------
     # Audio kill detection
@@ -579,162 +529,6 @@ class CS2DataPipeline:
         return verified
 
     # -------------------------------------------------------------------------
-    # Kill feed onset detection (dark bar scanning)
-    # -------------------------------------------------------------------------
-
-    def _detect_killfeed_onsets(self, video_path, fps, total_frames, width, height,
-                                progress_callback=None):
-        """
-        Scan video for kill feed dark bar onsets (rising edges).
-
-        Tracks dark_ratio in the kill feed ROI over time and detects when it
-        transitions from below threshold to above — indicating a new kill feed
-        entry appeared. This catches kills that audio fingerprinting missed.
-        """
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            return []
-
-        roi_x1 = int(width * self.config["roi_x_start_ratio"])
-        roi_x2 = int(width * self.config["roi_x_end_ratio"])
-        roi_y1 = int(height * self.config["roi_y_start_ratio"])
-        roi_y2 = int(height * self.config["roi_y_end_ratio"])
-
-        dark_threshold = 60
-        onset_threshold = 0.25
-        # Minimum increase in dark_ratio to count as a new entry
-        rise_threshold = 0.10
-        frame_skip = self.config["frame_skip"]
-        cooldown_frames = int(self.config["cooldown_seconds"] * fps)
-
-        detections = []
-        frame_number = 0
-        prev_dark_ratio = 0.0
-        last_detection_frame = -cooldown_frames
-        analyzed = 0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if frame_number % frame_skip == 0:
-                roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                dark_ratio = np.count_nonzero(gray < dark_threshold) / gray.size
-
-                # Detect rising edge: dark_ratio crosses above threshold
-                # AND increased significantly from previous sample
-                is_onset = (
-                    dark_ratio > onset_threshold
-                    and (prev_dark_ratio < onset_threshold or dark_ratio - prev_dark_ratio > rise_threshold)
-                    and (frame_number - last_detection_frame) >= cooldown_frames
-                )
-
-                if is_onset:
-                    timestamp = frame_number / fps
-                    detections.append({
-                        "timestamp": round(timestamp, 2),
-                        "frame_number": frame_number,
-                        "confidence": round(min(dark_ratio, 1.0), 4),
-                        "dark_ratio": round(dark_ratio, 4),
-                        "detection_method": "killfeed_onset",
-                    })
-                    last_detection_frame = frame_number
-
-                prev_dark_ratio = dark_ratio
-                analyzed += 1
-
-                if analyzed % 100 == 0 and progress_callback:
-                    pct = int((frame_number / total_frames) * 100)
-                    logger.info(f"Onset tarama: {pct}% ({analyzed} kare)")
-
-            frame_number += 1
-
-        cap.release()
-        return detections
-
-    # -------------------------------------------------------------------------
-    # Visual kill detection (fallback)
-    # -------------------------------------------------------------------------
-
-    def _detect_kills_visual(self, video_path, fps, total_frames, width, height,
-                             progress_callback=None):
-        """
-        Fallback: detect kill feed changes via frame differencing.
-        Detects ALL kill feed activity (not just personal kills).
-        """
-        video_path = Path(video_path)
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Video acilamadi: {video_path}")
-
-        # Calculate ROI pixel coordinates
-        roi_x1 = int(width * self.config["roi_x_start_ratio"])
-        roi_x2 = int(width * self.config["roi_x_end_ratio"])
-        roi_y1 = int(height * self.config["roi_y_start_ratio"])
-        roi_y2 = int(height * self.config["roi_y_end_ratio"])
-        logger.info(f"ROI: ({roi_x1},{roi_y1}) -> ({roi_x2},{roi_y2})")
-
-        diff_threshold = self.config["diff_threshold"]
-        noise_threshold = self.config["diff_noise_threshold"]
-        global_scale = self.config["global_scale_factor"]
-
-        raw_detections = []
-        frame_skip = self.config["frame_skip"]
-        frame_number = 0
-        analyzed = 0
-        prev_roi_gray = None
-        prev_global_gray = None
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if frame_number % frame_skip == 0:
-                roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-                small = cv2.resize(frame, (0, 0), fx=global_scale, fy=global_scale)
-                global_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
-                if prev_roi_gray is not None:
-                    roi_diff = cv2.absdiff(roi_gray, prev_roi_gray)
-                    roi_diff[roi_diff < noise_threshold] = 0
-                    roi_change = np.count_nonzero(roi_diff) / roi_diff.size
-
-                    global_diff = cv2.absdiff(global_gray, prev_global_gray)
-                    global_diff[global_diff < noise_threshold] = 0
-                    global_change = np.count_nonzero(global_diff) / global_diff.size
-
-                    if roi_change >= diff_threshold and roi_change > global_change * 2:
-                        timestamp = frame_number / fps
-                        confidence = min(roi_change / diff_threshold, 1.0)
-                        raw_detections.append({
-                            "timestamp": round(timestamp, 2),
-                            "frame_number": frame_number,
-                            "confidence": round(confidence, 4),
-                            "roi_change": round(roi_change, 6),
-                            "global_change": round(global_change, 6),
-                            "detection_method": "visual",
-                        })
-
-                prev_roi_gray = roi_gray
-                prev_global_gray = global_gray
-
-                analyzed += 1
-                if analyzed % 100 == 0:
-                    pct = int((frame_number / total_frames) * 100)
-                    logger.info(f"Analiz: {pct}% ({analyzed} kare islendi)")
-
-            frame_number += 1
-
-        cap.release()
-        logger.info(f"Gorsel analiz: {analyzed} kare islendi, {len(raw_detections)} ham eslesme")
-        return raw_detections
-
-    # -------------------------------------------------------------------------
     # Common
     # -------------------------------------------------------------------------
 
@@ -837,38 +631,6 @@ class CS2DataPipeline:
         logger.info(f"Toplam {len(kill_dirs)} kill, {len(kill_dirs) * 10} frame")
         return kill_dirs
 
-    def _ffmpeg_cut(self, video_path, start, end, output_path):
-        """Execute a single FFmpeg cut with -c copy (no re-encoding)."""
-        duration = end - start
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss", f"{start:.3f}",
-            "-i", str(video_path),
-            "-t", f"{duration:.3f}",
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            str(output_path)
-        ]
-
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
-            return True
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"FFmpeg error: {e.stderr[:200]}")
-            return False
-        except subprocess.TimeoutExpired:
-            logger.warning(f"FFmpeg timed out for {output_path}")
-            return False
-
-    def _get_video_duration(self, video_path):
-        """Get video duration in seconds using OpenCV."""
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        return total_frames / fps if fps > 0 else 0
-
     # =========================================================================
     # Phase 4: Metadata Generation
     # =========================================================================
@@ -894,7 +656,7 @@ class CS2DataPipeline:
         metadata = {
             "session_id": session_id,
             "created_at": datetime.now().isoformat(),
-            "pipeline_version": "3.0.0",
+            "pipeline_version": "4.0.0",
             "source": {
                 "url": url,
                 "platform": "medal.tv",
@@ -913,15 +675,11 @@ class CS2DataPipeline:
                     "y_end_ratio": self.config["roi_y_end_ratio"],
                 },
                 "cooldown_seconds": self.config["cooldown_seconds"],
-                "frame_skip": self.config["frame_skip"],
                 "kill_sound_freq_range": [
                     self.config["kill_sound_freq_low"],
                     self.config["kill_sound_freq_high"],
                 ],
-                "fingerprint_snippet_ms": self.config["fingerprint_snippet_ms"],
                 "fingerprint_ncc_threshold": self.config["fingerprint_ncc_threshold"],
-                "diff_threshold": self.config["diff_threshold"],
-                "diff_noise_threshold": self.config["diff_noise_threshold"],
             },
             "detections": [],
             "annotations": [],
@@ -939,13 +697,9 @@ class CS2DataPipeline:
                 "timestamp_seconds": det["timestamp"],
                 "frame_number": det["frame_number"],
                 "confidence": det["confidence"],
-                "detection_method": det.get("detection_method", "unknown"),
-                "audio_flux": det.get("audio_flux"),
                 "ncc_score": det.get("ncc_score"),
                 "dark_ratio": det.get("dark_ratio"),
-                "roi_change": det.get("roi_change"),
-                "global_change": det.get("global_change"),
-                "frame_file": det.get("frame_file", ""),
+                "frame_dir": det.get("frame_dir", ""),
             })
 
             metadata["annotations"].append({
