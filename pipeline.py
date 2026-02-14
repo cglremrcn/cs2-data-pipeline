@@ -181,12 +181,11 @@ class CS2DataPipeline:
 
         # Step 1: Audio fingerprinting — find personal kill sounds
         audio_dets = []
-        near_misses = []
         audio_path = self._extract_audio(video_path)
         if audio_path:
             try:
-                audio_dets, near_misses = self._detect_kill_sounds(audio_path, fps)
-                logger.info(f"Ses fingerprint: {len(audio_dets)} kill sesi, {len(near_misses)} near-miss")
+                audio_dets, _ = self._detect_kill_sounds(audio_path, fps)
+                logger.info(f"Ses fingerprint: {len(audio_dets)} kill sesi")
             except Exception as e:
                 logger.warning(f"Ses analizi basarisiz: {e}")
             finally:
@@ -201,21 +200,6 @@ class CS2DataPipeline:
         logger.info(f"Kill feed dogrulama: {len(verified)}/{len(audio_dets)} onaylandi")
 
         detections = self._apply_cooldown(verified)
-
-        # Step 3: Check near-misses — audio almost caught these, verify with kill feed
-        if near_misses:
-            cooldown = self.config["cooldown_seconds"]
-            verified_near = self._verify_kill_feed(video_path, near_misses, fps, width, height)
-            for nm in verified_near:
-                already_covered = any(
-                    abs(nm["timestamp"] - d["timestamp"]) < cooldown
-                    for d in detections
-                )
-                if not already_covered:
-                    nm["detection_method"] = "near_miss+killfeed"
-                    detections.append(nm)
-                    logger.info(f"  Near-miss eklendi: t={nm['timestamp']:.2f}s, NCC={nm['ncc_score']:.3f}")
-            detections.sort(key=lambda x: x["timestamp"])
 
         logger.info(f"Tespit tamamlandi: {len(detections)} kill")
         return detections
