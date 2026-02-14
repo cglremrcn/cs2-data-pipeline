@@ -33,15 +33,21 @@ Open `http://localhost:5000` in your browser. Paste a Medal.tv URL and click "Ba
 
 ### Kill Detection Algorithm
 
-**Primary: Audio analysis** (personal kills only)
-- Extracts audio from video via FFmpeg
-- Computes spectral flux in the kill confirmation sound frequency band (1800-4500 Hz)
-- Adaptive threshold (median + 2.5x standard deviation) detects kill "ding" sounds
-- Only the local player's kill confirmation sound is analyzed — teammate/enemy kills are ignored
+**Primary: Auto-calibrating audio fingerprinting** (personal kills only)
+- Two-pass approach: spectral flux candidates → audio fingerprint matching
+- Pass 1: Detects all audio onset candidates in the 1800-4500 Hz band (over-detects intentionally)
+- Auto-calibration: Extracts audio snippets from top candidates, computes pairwise Normalized Cross-Correlation (NCC), identifies the repeating kill sound pattern automatically
+- Pass 2: Scores all candidates against the discovered reference — only matching sounds (NCC ≥ 0.4) are kept
+- No manual template needed — the kill sound is discovered from the clip itself
+
+**Cross-validation with visual detection**
+- Kill feed ROI (top-right 30%) monitored via frame differencing
+- Audio fingerprint results validated against visual kill feed activity
+- If cross-validation is too aggressive, fingerprint results are trusted alone
 
 **Fallback: Visual frame differencing** (all kill feed activity)
 - Used when audio is unavailable (no audio track, extraction failure)
-- Monitors kill feed ROI (top-right 30%) for pixel changes
+- Monitors kill feed ROI for pixel changes
 - Filters camera movement by comparing ROI vs global frame changes
 
 **Cooldown:** 1.0 second (allows rapid multikills while preventing duplicate detections)
