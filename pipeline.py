@@ -7,6 +7,7 @@ import subprocess
 import json
 import logging
 import time
+import wave
 from pathlib import Path
 from datetime import datetime
 
@@ -26,12 +27,21 @@ DEFAULT_CONFIG = {
     "roi_y_start_ratio": 0.0,
     "roi_y_end_ratio": 0.185,
 
-    # Detection (frame differencing)
+    # Detection
     "frame_skip": 6,
+    "cooldown_seconds": 1.0,
+
+    # Audio kill sound detection (primary method)
+    "kill_sound_freq_low": 1800,
+    "kill_sound_freq_high": 4500,
+    "audio_peak_multiplier": 2.5,
+    "audio_window_ms": 50,
+    "audio_hop_ms": 10,
+
+    # Visual detection fallback
     "diff_threshold": 0.03,
     "diff_noise_threshold": 30,
     "global_scale_factor": 0.25,
-    "cooldown_seconds": 4.0,
 
     # Clip Extraction
     "clip_pre_seconds": 3.0,
@@ -40,7 +50,6 @@ DEFAULT_CONFIG = {
 
     # Metadata
     "metadata_dir": "metadata",
-
 }
 
 
@@ -140,26 +149,184 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect kill moments via frame differencing in the kill feed ROI.
-        Compares ROI pixel changes against global frame changes to filter
-        camera movement and scene transitions.
-        Returns list of detection dicts with timestamp, confidence, etc.
+        Detect personal kills using audio kill sound analysis.
+        Falls back to visual kill feed detection if audio is unavailable.
         """
         if progress_callback:
             progress_callback("detecting", "Kill anlari tespit ediliyor...")
 
         video_path = Path(video_path)
+
+        # Get video info
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Video acilamadi: {video_path}")
-
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         duration = total_frames / fps if fps > 0 else 0
+        cap.release()
 
         logger.info(f"Video: {width}x{height}, {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
+
+        # Primary: Audio-based detection (personal kills only)
+        raw_detections = None
+        audio_path = self._extract_audio(video_path)
+
+        if audio_path:
+            try:
+                raw_detections = self._detect_kill_sounds(audio_path, fps)
+                if raw_detections:
+                    logger.info(f"Ses analizi: {len(raw_detections)} kisisel kill sesi tespit edildi")
+                else:
+                    logger.info("Ses analizi: kill sesi bulunamadi, gorsel tespite geciliyor")
+                    raw_detections = None
+            except Exception as e:
+                logger.warning(f"Ses analizi basarisiz: {e}")
+            finally:
+                audio_path.unlink(missing_ok=True)
+
+        # Fallback: Visual detection (detects all kill feed activity)
+        if raw_detections is None:
+            logger.info("Gorsel tespit kullaniliyor (kill feed ROI)")
+            raw_detections = self._detect_kills_visual(
+                video_path, fps, total_frames, width, height, progress_callback
+            )
+
+        detections = self._apply_cooldown(raw_detections)
+
+        logger.info(f"Tespit tamamlandi: {len(raw_detections)} ham, "
+                     f"{len(detections)} filtrelenmis kill")
+        return detections
+
+    # -------------------------------------------------------------------------
+    # Audio kill detection
+    # -------------------------------------------------------------------------
+
+    def _extract_audio(self, video_path):
+        """Extract mono WAV audio from video using FFmpeg."""
+        audio_path = video_path.parent / (video_path.stem + "_audio.wav")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", "22050",
+            "-ac", "1",
+            str(audio_path)
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=30)
+            if audio_path.exists() and audio_path.stat().st_size > 1000:
+                logger.info(f"Ses cikarildi: {audio_path.name}")
+                return audio_path
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Ses cikarma basarisiz: {e}")
+
+        # Cleanup on failure
+        if audio_path.exists():
+            audio_path.unlink(missing_ok=True)
+        return None
+
+    def _detect_kill_sounds(self, audio_path, fps):
+        """
+        Detect CS2 kill confirmation sounds using spectral flux analysis.
+
+        The kill confirmation "ding" is a short, high-pitched metallic sound
+        (~1800-4500 Hz) that only plays for the local player's kills.
+        We detect it by measuring onset strength (spectral flux) in that band.
+        """
+        with wave.open(str(audio_path), 'rb') as wf:
+            rate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+        audio /= 32768.0  # normalize to [-1, 1]
+
+        if len(audio) == 0:
+            return []
+
+        # STFT parameters
+        win_size = int(self.config["audio_window_ms"] / 1000 * rate)
+        hop_size = int(self.config["audio_hop_ms"] / 1000 * rate)
+        freq_low = self.config["kill_sound_freq_low"]
+        freq_high = self.config["kill_sound_freq_high"]
+        multiplier = self.config["audio_peak_multiplier"]
+
+        # Precompute window and frequency mask
+        hann = np.hanning(win_size)
+        freqs = np.fft.rfftfreq(win_size, 1.0 / rate)
+        band_mask = (freqs >= freq_low) & (freqs <= freq_high)
+
+        # Compute spectral flux in kill sound frequency band
+        prev_band = None
+        flux_list = []
+        time_list = []
+
+        for start in range(0, len(audio) - win_size, hop_size):
+            chunk = audio[start:start + win_size] * hann
+            spectrum = np.abs(np.fft.rfft(chunk))
+            band = spectrum[band_mask]
+
+            if prev_band is not None and len(band) == len(prev_band):
+                # Half-wave rectified spectral flux (onset detection only)
+                flux = np.sum(np.maximum(band - prev_band, 0))
+                flux_list.append(flux)
+                time_list.append(start / rate)
+
+            prev_band = band.copy()
+
+        if not flux_list:
+            return []
+
+        flux_arr = np.array(flux_list)
+
+        # Adaptive threshold: median + multiplier * standard deviation
+        median_flux = np.median(flux_arr)
+        std_flux = np.std(flux_arr)
+        threshold = median_flux + multiplier * std_flux
+
+        logger.info(f"Ses analizi: median={median_flux:.2f}, std={std_flux:.2f}, "
+                     f"threshold={threshold:.2f}")
+
+        # Peak detection with minimum distance (0.5s between peaks)
+        min_dist = int(0.5 * rate / hop_size)
+        detections = []
+        last_idx = -min_dist
+
+        for i in range(len(flux_arr)):
+            if flux_arr[i] > threshold and (i - last_idx) >= min_dist:
+                ts = time_list[i]
+                # Confidence: how far above threshold (0.5 at threshold, 1.0 at 3x)
+                conf = min((flux_arr[i] / threshold - 1) / 2 + 0.5, 1.0)
+                detections.append({
+                    "timestamp": round(ts, 2),
+                    "frame_number": int(ts * fps),
+                    "confidence": round(conf, 4),
+                    "audio_flux": round(float(flux_arr[i]), 4),
+                    "detection_method": "audio",
+                })
+                last_idx = i
+
+        return detections
+
+    # -------------------------------------------------------------------------
+    # Visual kill detection (fallback)
+    # -------------------------------------------------------------------------
+
+    def _detect_kills_visual(self, video_path, fps, total_frames, width, height,
+                             progress_callback=None):
+        """
+        Fallback: detect kill feed changes via frame differencing.
+        Detects ALL kill feed activity (not just personal kills).
+        """
+        video_path = Path(video_path)
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Video acilamadi: {video_path}")
 
         # Calculate ROI pixel coordinates
         roi_x1 = int(width * self.config["roi_x_start_ratio"])
@@ -185,27 +352,21 @@ class CS2DataPipeline:
                 break
 
             if frame_number % frame_skip == 0:
-                # Extract ROI and convert to grayscale
                 roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
                 roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-                # Downscale full frame for global change measurement
                 small = cv2.resize(frame, (0, 0), fx=global_scale, fy=global_scale)
                 global_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
                 if prev_roi_gray is not None:
-                    # ROI difference
                     roi_diff = cv2.absdiff(roi_gray, prev_roi_gray)
                     roi_diff[roi_diff < noise_threshold] = 0
                     roi_change = np.count_nonzero(roi_diff) / roi_diff.size
 
-                    # Global difference
                     global_diff = cv2.absdiff(global_gray, prev_global_gray)
                     global_diff[global_diff < noise_threshold] = 0
                     global_change = np.count_nonzero(global_diff) / global_diff.size
 
-                    # Kill detected: ROI change above threshold AND significantly
-                    # more than global change (filters camera movement)
                     if roi_change >= diff_threshold and roi_change > global_change * 2:
                         timestamp = frame_number / fps
                         confidence = min(roi_change / diff_threshold, 1.0)
@@ -215,6 +376,7 @@ class CS2DataPipeline:
                             "confidence": round(confidence, 4),
                             "roi_change": round(roi_change, 6),
                             "global_change": round(global_change, 6),
+                            "detection_method": "visual",
                         })
 
                 prev_roi_gray = roi_gray
@@ -228,14 +390,12 @@ class CS2DataPipeline:
             frame_number += 1
 
         cap.release()
+        logger.info(f"Gorsel analiz: {analyzed} kare islendi, {len(raw_detections)} ham eslesme")
+        return raw_detections
 
-        # Apply cooldown filter
-        detections = self._apply_cooldown(raw_detections)
-
-        logger.info(f"Analiz tamamlandi: {analyzed} kare islendi, "
-                     f"{len(raw_detections)} ham eslesme, {len(detections)} kill tespit edildi")
-
-        return detections
+    # -------------------------------------------------------------------------
+    # Common
+    # -------------------------------------------------------------------------
 
     def _apply_cooldown(self, detections):
         """Filter detections that are too close together, keeping the highest confidence one."""
@@ -349,7 +509,7 @@ class CS2DataPipeline:
         metadata = {
             "session_id": session_id,
             "created_at": datetime.now().isoformat(),
-            "pipeline_version": "2.0.0",
+            "pipeline_version": "2.1.0",
             "source": {
                 "url": url,
                 "platform": "medal.tv",
@@ -360,17 +520,21 @@ class CS2DataPipeline:
                 "file_size_bytes": file_size,
             },
             "detection_config": {
-                "method": "frame_difference",
+                "method": "audio+visual_fallback",
                 "roi": {
                     "x_start_ratio": self.config["roi_x_start_ratio"],
                     "x_end_ratio": self.config["roi_x_end_ratio"],
                     "y_start_ratio": self.config["roi_y_start_ratio"],
                     "y_end_ratio": self.config["roi_y_end_ratio"],
                 },
-                "diff_threshold": self.config["diff_threshold"],
-                "diff_noise_threshold": self.config["diff_noise_threshold"],
                 "cooldown_seconds": self.config["cooldown_seconds"],
                 "frame_skip": self.config["frame_skip"],
+                "kill_sound_freq_range": [
+                    self.config["kill_sound_freq_low"],
+                    self.config["kill_sound_freq_high"],
+                ],
+                "diff_threshold": self.config["diff_threshold"],
+                "diff_noise_threshold": self.config["diff_noise_threshold"],
             },
             "detections": [],
             "annotations": [],
@@ -388,8 +552,10 @@ class CS2DataPipeline:
                 "timestamp_seconds": det["timestamp"],
                 "frame_number": det["frame_number"],
                 "confidence": det["confidence"],
-                "roi_change": det.get("roi_change", 0),
-                "global_change": det.get("global_change", 0),
+                "detection_method": det.get("detection_method", "unknown"),
+                "audio_flux": det.get("audio_flux"),
+                "roi_change": det.get("roi_change"),
+                "global_change": det.get("global_change"),
                 "clip_file": det.get("clip_file", ""),
                 "clip_start": det.get("clip_start", 0),
                 "clip_end": det.get("clip_end", 0),
