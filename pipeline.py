@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
 
     # Detection
     "frame_skip": 6,
-    "cooldown_seconds": 1.0,
+    "cooldown_seconds": 0.5,
 
     # Audio kill sound detection
     "kill_sound_freq_low": 1800,
@@ -51,8 +51,8 @@ DEFAULT_CONFIG = {
     "fingerprint_top_n": 15,
 
     # Clip Extraction
-    "clip_pre_seconds": 3.0,
-    "clip_post_seconds": 3.0,
+    "clip_pre_seconds": 2.0,
+    "clip_post_seconds": 2.0,
     "clips_dir": "clips",
 
     # Metadata
@@ -156,14 +156,10 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect personal kills using audio fingerprinting + kill feed verification,
-        supplemented by kill feed onset scanning to catch kills audio missed.
+        Detect personal kills using audio fingerprinting + kill feed verification.
 
         1. Audio: two-pass NCC fingerprinting to find kill sound candidates
-        2. Kill feed verification: reject audio candidates without visible dark bars
-        3. Kill feed onset scan: detect dark bar appearances throughout the video
-        4. Merge: add onset detections not already covered by audio
-        Falls back to kill feed onset only if audio is unavailable.
+        2. Kill feed verification: reject candidates without visible dark bars
         """
         if progress_callback:
             progress_callback("detecting", "Kill anlari tespit ediliyor...")
@@ -195,36 +191,15 @@ class CS2DataPipeline:
             finally:
                 audio_path.unlink(missing_ok=True)
 
-        # Step 2: Kill feed onset scan — detect all dark bar appearances
-        onset_dets = self._detect_killfeed_onsets(
-            video_path, fps, total_frames, width, height, progress_callback
-        )
-        logger.info(f"Kill feed onset: {len(onset_dets)} olay")
-
         if not audio_dets:
-            # Audio unavailable — use onset detections only
-            detections = self._apply_cooldown(onset_dets)
-            logger.info(f"Tespit tamamlandi: {len(detections)} kill (onset)")
-            return detections
+            logger.info("Ses bulunamadi")
+            return []
 
-        # Step 3: Verify audio candidates against kill feed
+        # Step 2: Verify each audio candidate — is kill feed visible?
         verified = self._verify_kill_feed(video_path, audio_dets, fps, width, height)
         logger.info(f"Kill feed dogrulama: {len(verified)}/{len(audio_dets)} onaylandi")
 
-        # Step 4: Merge — add onset detections not covered by audio
-        merge_window = self.config["cooldown_seconds"]
-        merged = list(verified)
-        for onset in onset_dets:
-            already_covered = any(
-                abs(onset["timestamp"] - v["timestamp"]) < merge_window
-                for v in verified
-            )
-            if not already_covered:
-                merged.append(onset)
-                logger.info(f"  Onset eklendi: t={onset['timestamp']:.2f}s (ses tarafindan kacirildi)")
-
-        merged.sort(key=lambda x: x["timestamp"])
-        detections = self._apply_cooldown(merged)
+        detections = self._apply_cooldown(verified)
 
         logger.info(f"Tespit tamamlandi: {len(detections)} kill")
         return detections
@@ -782,9 +757,8 @@ class CS2DataPipeline:
 
     def cut_clips(self, video_path, detections, session_id, progress_callback=None):
         """
-        Cut clips around kill moments using FFmpeg.
-        Merges overlapping clip windows into single clips when kills are
-        close together (within clip_pre + clip_post seconds).
+        Cut one 4-second clip per kill (2s before, 2s after).
+        Each kill gets its own separate clip, no merging.
         Returns list of created clip paths.
         """
         if progress_callback:
@@ -794,47 +768,28 @@ class CS2DataPipeline:
         clip_dir = self.base_dir / self.config["clips_dir"] / session_id
         clip_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get video duration for boundary clamping
         duration = self._get_video_duration(video_path)
         pre = self.config["clip_pre_seconds"]
         post = self.config["clip_post_seconds"]
-
-        # Group detections into merged clip windows
-        groups = []
-        for det in detections:
-            start = max(0, det["timestamp"] - pre)
-            end = min(duration, det["timestamp"] + post)
-
-            if groups and start <= groups[-1]["end"]:
-                # Overlapping — extend current group
-                groups[-1]["end"] = end
-                groups[-1]["detections"].append(det)
-            else:
-                groups.append({"start": start, "end": end, "detections": [det]})
-
         clip_paths = []
 
-        for i, group in enumerate(groups, 1):
-            start = round(group["start"], 2)
-            end = round(group["end"], 2)
+        for i, det in enumerate(detections, 1):
+            start = max(0, det["timestamp"] - pre)
+            end = min(duration, det["timestamp"] + post)
             clip_name = f"cs2_clip_{i:03d}.mp4"
             output_path = clip_dir / clip_name
 
             success = self._ffmpeg_cut(video_path, start, end, output_path)
             if success:
                 clip_paths.append(output_path)
-                clip_rel = str(output_path.relative_to(self.base_dir))
-                for det in group["detections"]:
-                    det["clip_file"] = clip_rel
-                    det["clip_start"] = start
-                    det["clip_end"] = end
-                kills = len(group["detections"])
-                label = f"{kills} kill" if kills > 1 else ""
-                logger.info(f"Klip kesildi: {clip_name} ({start:.1f}s - {end:.1f}s) {label}".rstrip())
+                det["clip_file"] = str(output_path.relative_to(self.base_dir))
+                det["clip_start"] = round(start, 2)
+                det["clip_end"] = round(end, 2)
+                logger.info(f"Klip kesildi: {clip_name} ({start:.1f}s - {end:.1f}s)")
             else:
                 logger.warning(f"Klip kesilemedi: {clip_name}")
 
-        logger.info(f"Toplam {len(clip_paths)} klip olusturuldu ({len(detections)} kill)")
+        logger.info(f"Toplam {len(clip_paths)}/{len(detections)} klip olusturuldu")
         return clip_paths
 
     def _ffmpeg_cut(self, video_path, start, end, output_path):
