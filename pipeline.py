@@ -156,14 +156,12 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect personal kills using auto-calibrating audio fingerprinting
-        with visual cross-validation.
+        Detect personal kills using audio fingerprinting + kill feed verification.
 
-        1. Audio: two-pass fingerprinting to find the player's kill sound
-        2. Visual: scan kill feed ROI for ALL kill events
-        3. Cross-validate: keep audio detections confirmed by visual feed
-        4. Fallback: if audio fingerprinting succeeds but cross-validation
-           removes too many, trust fingerprinting alone
+        1. Audio: two-pass NCC fingerprinting to find kill sound candidates
+        2. Visual verification: check if kill feed entries (dark bars) are
+           visible at each candidate's timestamp — rejects false positives
+           where no kill feed is showing
         Falls back to visual-only if audio is unavailable.
         """
         if progress_callback:
@@ -196,31 +194,21 @@ class CS2DataPipeline:
             finally:
                 audio_path.unlink(missing_ok=True)
 
-        # Step 2: Visual detection — find ALL kill feed events
-        visual_dets = self._detect_kills_visual(
-            video_path, fps, total_frames, width, height, progress_callback
-        )
-        logger.info(f"Gorsel: {len(visual_dets)} kill feed olayı")
-
-        # Step 3: Cross-validate or fallback
-        if audio_dets and visual_dets:
-            raw_detections = self._cross_validate(audio_dets, visual_dets)
-            logger.info(f"Cross-validation: {len(raw_detections)} onaylanmis kill")
-
-            # Only fall back to audio alone if cross-validation gives ZERO
-            if not raw_detections:
-                logger.warning("Cross-validation bos, fingerprint sonuclari kullaniliyor")
-                raw_detections = audio_dets
-        elif audio_dets:
-            logger.info("Gorsel tespit bos, fingerprint sonuclari kullaniliyor")
-            raw_detections = audio_dets
-        elif visual_dets:
+        if not audio_dets:
+            # Fallback: visual-only detection
             logger.info("Ses bulunamadi, gorsel tespit kullaniliyor")
-            raw_detections = visual_dets
-        else:
-            raw_detections = []
+            visual_dets = self._detect_kills_visual(
+                video_path, fps, total_frames, width, height, progress_callback
+            )
+            detections = self._apply_cooldown(visual_dets)
+            logger.info(f"Tespit tamamlandi: {len(detections)} kill (gorsel)")
+            return detections
 
-        detections = self._apply_cooldown(raw_detections)
+        # Step 2: Verify each audio candidate — is kill feed visible?
+        verified = self._verify_kill_feed(video_path, audio_dets, fps, width, height)
+        logger.info(f"Kill feed dogrulama: {len(verified)}/{len(audio_dets)} onaylandi")
+
+        detections = self._apply_cooldown(verified)
 
         logger.info(f"Tespit tamamlandi: {len(detections)} kill")
         return detections
@@ -533,6 +521,70 @@ class CS2DataPipeline:
         return float(np.max(valid) / (norm_a * norm_b))
 
     # -------------------------------------------------------------------------
+    # Kill feed verification (dark bar detection)
+    # -------------------------------------------------------------------------
+
+    def _verify_kill_feed(self, video_path, audio_dets, fps, width, height):
+        """
+        Verify audio candidates by checking if kill feed entries are visible.
+
+        CS2 kill feed entries have dark semi-transparent background bars.
+        We measure the ratio of dark pixels (brightness < 60) in the kill feed
+        ROI at each candidate's timestamp. Real kills have dark_ratio > 0.25,
+        false positives (empty ROI) have dark_ratio near 0.
+
+        Checks at offsets [-0.5, 0, +0.5, +1.0] seconds from each candidate
+        and keeps the candidate if ANY offset shows dark_ratio > 0.25.
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            logger.warning("Kill feed dogrulama icin video acilamadi")
+            return audio_dets  # Can't verify, return all
+
+        # Calculate ROI pixel coordinates
+        roi_x1 = int(width * self.config["roi_x_start_ratio"])
+        roi_x2 = int(width * self.config["roi_x_end_ratio"])
+        roi_y1 = int(height * self.config["roi_y_start_ratio"])
+        roi_y2 = int(height * self.config["roi_y_end_ratio"])
+
+        dark_threshold = 60    # Pixel brightness threshold
+        ratio_threshold = 0.25  # Min dark pixel ratio to confirm kill feed
+        offsets = [-0.5, 0.0, 0.5, 1.0]  # Seconds relative to candidate
+
+        verified = []
+
+        for det in audio_dets:
+            ts = det["timestamp"]
+            max_dark_ratio = 0.0
+
+            for offset in offsets:
+                check_ts = ts + offset
+                if check_ts < 0:
+                    continue
+
+                frame_num = int(check_ts * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                dark_ratio = np.count_nonzero(gray < dark_threshold) / gray.size
+                max_dark_ratio = max(max_dark_ratio, dark_ratio)
+
+            if max_dark_ratio > ratio_threshold:
+                det["dark_ratio"] = round(max_dark_ratio, 4)
+                det["detection_method"] = "audio+killfeed"
+                verified.append(det)
+                logger.info(f"  Onaylandi: t={ts:.2f}s, dark_ratio={max_dark_ratio:.3f}")
+            else:
+                logger.info(f"  Reddedildi: t={ts:.2f}s, dark_ratio={max_dark_ratio:.3f}")
+
+        cap.release()
+        return verified
+
+    # -------------------------------------------------------------------------
     # Visual kill detection (fallback)
     # -------------------------------------------------------------------------
 
@@ -739,7 +791,7 @@ class CS2DataPipeline:
                 "file_size_bytes": file_size,
             },
             "detection_config": {
-                "method": "audio_fingerprint+visual_crossvalidation",
+                "method": "audio_fingerprint+killfeed_verification",
                 "roi": {
                     "x_start_ratio": self.config["roi_x_start_ratio"],
                     "x_end_ratio": self.config["roi_x_end_ratio"],
@@ -776,6 +828,7 @@ class CS2DataPipeline:
                 "detection_method": det.get("detection_method", "unknown"),
                 "audio_flux": det.get("audio_flux"),
                 "ncc_score": det.get("ncc_score"),
+                "dark_ratio": det.get("dark_ratio"),
                 "roi_change": det.get("roi_change"),
                 "global_change": det.get("global_change"),
                 "clip_file": det.get("clip_file", ""),
