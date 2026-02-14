@@ -38,8 +38,8 @@ DEFAULT_CONFIG = {
     "audio_hop_ms": 10,
 
     # Visual kill feed detection
-    "diff_threshold": 0.03,
-    "diff_noise_threshold": 30,
+    "diff_threshold": 0.08,
+    "diff_noise_threshold": 40,
     "global_scale_factor": 0.25,
 
     # Cross-validation
@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
 
     # Audio fingerprinting (auto-calibration)
     "fingerprint_snippet_ms": 250,
-    "fingerprint_ncc_threshold": 0.35,
+    "fingerprint_ncc_threshold": 0.3,
     "fingerprint_top_n": 15,
 
     # Clip Extraction
@@ -387,26 +387,24 @@ class CS2DataPipeline:
             cooled.sort(key=lambda x: x["audio_flux"], reverse=True)
             return cooled[:8]
 
-        # ---- Build consensus reference from cluster members ----
-        cluster_indices = [i for i in range(n) if ncc_matrix[ref_idx][i] >= ncc_threshold]
-        consensus = np.mean([snippets[i] for i in cluster_indices], axis=0)
-        logger.info(f"Consensus reference: {len(cluster_indices)} snippet ortalamasindan olusturuldu")
-
-        # ---- Pass 2: Score ALL candidates against consensus reference ----
+        # ---- Pass 2: Score ALL candidates against single best reference ----
         final = []
+        near_miss = []
         for cand in candidates:
             snippet = self._extract_snippet(filtered, rate, cand["timestamp"], snippet_samples)
-            ncc = self._compute_ncc(consensus, snippet)
+            ncc = self._compute_ncc(ref_snippet, snippet)
             if ncc >= ncc_threshold:
                 cand["confidence"] = round(float(ncc), 4)
                 cand["ncc_score"] = round(float(ncc), 4)
                 final.append(cand)
             elif ncc >= ncc_threshold * 0.7:
-                logger.debug(f"  t={cand['timestamp']:.2f}s borderline NCC={ncc:.3f}")
+                near_miss.append((cand["timestamp"], ncc))
 
         logger.info(f"Pass 2: {len(final)}/{len(candidates)} aday onaylandi (NCC >= {ncc_threshold})")
         for f in sorted(final, key=lambda x: x["timestamp"]):
             logger.info(f"  -> t={f['timestamp']:.2f}s, NCC={f['ncc_score']:.3f}, flux={f['audio_flux']:.2f}")
+        if near_miss:
+            logger.info(f"  Near-miss ({len(near_miss)}): {', '.join(f't={t:.2f}s NCC={n:.3f}' for t,n in near_miss)}")
 
         return sorted(final, key=lambda x: x["timestamp"])
 
@@ -593,7 +591,7 @@ class CS2DataPipeline:
                     global_diff[global_diff < noise_threshold] = 0
                     global_change = np.count_nonzero(global_diff) / global_diff.size
 
-                    if roi_change >= diff_threshold and roi_change > global_change * 2:
+                    if roi_change >= diff_threshold and roi_change > global_change * 3:
                         timestamp = frame_number / fps
                         confidence = min(roi_change / diff_threshold, 1.0)
                         raw_detections.append({
