@@ -2,6 +2,7 @@
 downloads/
 clips/
 metadata/
+debug_frames/
 *.mp4
 *.avi
 *.mkv
@@ -30,6 +31,11 @@ env/
 # Claude
 CLAUDE.md
 .claude/
+
+# Test/debug scripts
+test_detection.py
+check_kills.py
+roi_diagnostic.py
 
 # Logs
 *.log
