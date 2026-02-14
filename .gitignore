@@ -1,15 +1,11 @@
-# Video and media files
+# Runtime output
 downloads/
 clips/
-debug_frames/
-frames/
+metadata/
 *.mp4
 *.avi
 *.mkv
 *.wav
-
-# Metadata output
-metadata/
 
 # Python
 __pycache__/
@@ -37,7 +33,6 @@ CLAUDE.md
 
 # Logs
 *.log
-pipeline.log
 
 # OS
 Thumbs.db
