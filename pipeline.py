@@ -755,45 +755,47 @@ class CS2DataPipeline:
         return filtered
 
     # =========================================================================
-    # Phase 3: Clip Extraction
+    # Phase 3: Kill Frame Extraction
     # =========================================================================
 
-    def cut_clips(self, video_path, detections, session_id, progress_callback=None):
+    def save_kill_frames(self, video_path, detections, session_id, progress_callback=None):
         """
-        Cut one 4-second clip per kill (2s before, 2s after).
-        Each kill gets its own separate clip, no merging.
-        Returns list of created clip paths.
+        Extract and save the exact frame at each kill timestamp as JPG.
+        Returns list of saved frame paths.
         """
         if progress_callback:
-            progress_callback("cutting", "Klipler kesiliyor...")
+            progress_callback("cutting", "Kill frame'leri kaydediliyor...")
 
         video_path = Path(video_path)
-        clip_dir = self.base_dir / self.config["clips_dir"] / session_id
-        clip_dir.mkdir(parents=True, exist_ok=True)
+        frame_dir = self.base_dir / self.config["clips_dir"] / session_id
+        frame_dir.mkdir(parents=True, exist_ok=True)
 
-        duration = self._get_video_duration(video_path)
-        pre = self.config["clip_pre_seconds"]
-        post = self.config["clip_post_seconds"]
-        clip_paths = []
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Video acilamadi: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_paths = []
 
         for i, det in enumerate(detections, 1):
-            start = max(0, det["timestamp"] - pre)
-            end = min(duration, det["timestamp"] + post)
-            clip_name = f"cs2_clip_{i:03d}.mp4"
-            output_path = clip_dir / clip_name
+            frame_num = int(det["timestamp"] * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning(f"Frame okunamadi: t={det['timestamp']:.2f}s")
+                continue
 
-            success = self._ffmpeg_cut(video_path, start, end, output_path)
-            if success:
-                clip_paths.append(output_path)
-                det["clip_file"] = str(output_path.relative_to(self.base_dir))
-                det["clip_start"] = round(start, 2)
-                det["clip_end"] = round(end, 2)
-                logger.info(f"Klip kesildi: {clip_name} ({start:.1f}s - {end:.1f}s)")
-            else:
-                logger.warning(f"Klip kesilemedi: {clip_name}")
+            frame_name = f"kill_{i:03d}.jpg"
+            output_path = frame_dir / frame_name
+            cv2.imwrite(str(output_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-        logger.info(f"Toplam {len(clip_paths)}/{len(detections)} klip olusturuldu")
-        return clip_paths
+            frame_paths.append(output_path)
+            det["frame_file"] = str(output_path.relative_to(self.base_dir))
+            logger.info(f"Frame kaydedildi: {frame_name} (t={det['timestamp']:.2f}s)")
+
+        cap.release()
+        logger.info(f"Toplam {len(frame_paths)}/{len(detections)} frame kaydedildi")
+        return frame_paths
 
     def _ffmpeg_cut(self, video_path, start, end, output_path):
         """Execute a single FFmpeg cut with -c copy (no re-encoding)."""
@@ -885,7 +887,7 @@ class CS2DataPipeline:
             "annotations": [],
             "summary": {
                 "total_kills_detected": len(detections),
-                "total_clips_created": len(clip_paths),
+                "total_frames_saved": len(clip_paths),
                 "average_confidence": 0,
             },
         }
@@ -903,15 +905,12 @@ class CS2DataPipeline:
                 "dark_ratio": det.get("dark_ratio"),
                 "roi_change": det.get("roi_change"),
                 "global_change": det.get("global_change"),
-                "clip_file": det.get("clip_file", ""),
-                "clip_start": det.get("clip_start", 0),
-                "clip_end": det.get("clip_end", 0),
+                "frame_file": det.get("frame_file", ""),
             })
 
             metadata["annotations"].append({
-                "clip_path": det.get("clip_file", ""),
+                "frame_path": det.get("frame_file", ""),
                 "label": "cs2_kill_moment",
-                "kill_timestamp_in_clip": self.config["clip_pre_seconds"],
                 "confidence": det["confidence"],
                 "source_game": "counter_strike_2",
             })
@@ -933,7 +932,7 @@ class CS2DataPipeline:
 
     def run(self, url, progress_callback=None):
         """
-        Full pipeline: download -> detect -> cut -> metadata.
+        Full pipeline: download -> detect -> save frames -> metadata.
         Returns summary dict.
         """
         start_time = time.time()
@@ -974,18 +973,18 @@ class CS2DataPipeline:
                     progress_callback("done", "Kill tespit edilemedi.")
                 result["status"] = "no_kills"
             else:
-                # Phase 3: Cut clips
-                logger.info(f"[3/4] {len(detections)} klip kesiliyor...")
-                clip_paths = self.cut_clips(video_path, detections, session_id, progress_callback)
-                result["clips_created"] = len(clip_paths)
-                result["clip_paths"] = [str(p.relative_to(self.base_dir)).replace("\\", "/") for p in clip_paths]
+                # Phase 3: Save kill frames
+                logger.info(f"[3/4] {len(detections)} kill frame kaydediliyor...")
+                frame_paths = self.save_kill_frames(video_path, detections, session_id, progress_callback)
+                result["clips_created"] = len(frame_paths)
+                result["clip_paths"] = [str(p.relative_to(self.base_dir)).replace("\\", "/") for p in frame_paths]
 
                 # Phase 4: Metadata
                 logger.info("[4/4] Metadata olusturuluyor...")
                 if progress_callback:
                     progress_callback("metadata", "Metadata olusturuluyor...")
                 meta_path = self.generate_metadata(
-                    video_path, url, detections, clip_paths, session_id
+                    video_path, url, detections, frame_paths, session_id
                 )
                 result["metadata_path"] = str(meta_path.relative_to(self.base_dir)).replace("\\", "/")
                 result["status"] = "completed"
@@ -996,12 +995,12 @@ class CS2DataPipeline:
             logger.info("=" * 60)
             logger.info(f"Pipeline tamamlandi! ({elapsed:.1f}s)")
             logger.info(f"  Kill tespit: {result['kills_detected']}")
-            logger.info(f"  Klip olusturuldu: {result['clips_created']}")
+            logger.info(f"  Frame kaydedildi: {result['clips_created']}")
             logger.info("=" * 60)
 
             if progress_callback:
                 progress_callback("done", f"Tamamlandi! {result['kills_detected']} kill, "
-                                          f"{result['clips_created']} klip.")
+                                          f"{result['clips_created']} frame.")
 
         except Exception as e:
             logger.error(f"Pipeline hatasi: {e}", exc_info=True)
