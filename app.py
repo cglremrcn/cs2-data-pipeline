@@ -88,7 +88,8 @@ def list_sessions():
                         "session_id": data.get("session_id", f.stem),
                         "created_at": data.get("created_at", ""),
                         "kills": data.get("summary", {}).get("total_kills_detected", 0),
-                        "clips": data.get("summary", {}).get("total_clips_created", 0),
+                        "clips": data.get("summary", {}).get("total_frames_saved",
+                                  data.get("summary", {}).get("total_clips_created", 0)),
                         "url": data.get("source", {}).get("url", ""),
                     })
             except (json.JSONDecodeError, KeyError):

@@ -11,7 +11,7 @@
         <!-- Header -->
         <div class="header">
             <h1>CS2 <span>Kill Detector</span></h1>
-            <p>Medal.tv kliplerinden kill anlarini tespit et ve klipleri kes</p>
+            <p>Medal.tv kliplerinden kill anlarini tespit et</p>
         </div>
 
         <!-- URL Input -->
@@ -32,7 +32,7 @@
             <div class="phases">
                 <div class="phase" id="phase-download">Indirme</div>
                 <div class="phase" id="phase-detect">Tespit</div>
-                <div class="phase" id="phase-cut">Kesme</div>
+                <div class="phase" id="phase-cut">Frame</div>
                 <div class="phase" id="phase-metadata">Metadata</div>
             </div>
             <div class="status-bar">
@@ -51,24 +51,14 @@
                 </div>
                 <div class="stat-card">
                     <div class="stat-value" id="statClips">0</div>
-                    <div class="stat-label">Klip Olusturuldu</div>
+                    <div class="stat-label">Frame Kaydedildi</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value" id="statTime">0s</div>
                     <div class="stat-label">Islem Suresi</div>
                 </div>
             </div>
-            <table class="detections-table" id="detectionsTable">
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>Zaman</th>
-                        <th>Guven</th>
-                        <th>Klip</th>
-                    </tr>
-                </thead>
-                <tbody id="detectionsBody"></tbody>
-            </table>
+            <div class="kill-frames" id="killFrames"></div>
         </div>
 
         <!-- History -->
@@ -192,20 +182,21 @@
         }
 
         function populateDetections(result) {
-            const tbody = document.getElementById('detectionsBody');
-            tbody.innerHTML = '';
+            const container = document.getElementById('killFrames');
+            container.innerHTML = '';
 
             if (!result.clip_paths) return;
 
-            result.clip_paths.forEach((clipPath, i) => {
-                const tr = document.createElement('tr');
-                tr.innerHTML = `
-                    <td>${i + 1}</td>
-                    <td>Klip ${i + 1}</td>
-                    <td><div class="confidence-bar" style="width:60px"></div></td>
-                    <td><a href="/${clipPath}" target="_blank" style="color:#ff4655">Indir</a></td>
+            result.clip_paths.forEach((framePath, i) => {
+                const card = document.createElement('div');
+                card.className = 'kill-frame-card';
+                card.innerHTML = `
+                    <div class="kill-frame-header">Kill ${i + 1}</div>
+                    <a href="/${framePath}" target="_blank">
+                        <img src="/${framePath}" alt="Kill ${i + 1}" class="kill-frame-img">
+                    </a>
                 `;
-                tbody.appendChild(tr);
+                container.appendChild(card);
             });
         }
 
@@ -244,7 +235,7 @@
                             <div style="color:#ccc; font-size:13px">${s.session_id}</div>
                             <div style="color:#555; font-size:11px">${s.created_at.split('T')[0] || ''}</div>
                         </div>
-                        <span class="kills-badge">${s.kills} kill &middot; ${s.clips} klip</span>
+                        <span class="kills-badge">${s.kills} kill</span>
                     </div>
                 `).join('');
             });
