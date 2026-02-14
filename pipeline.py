@@ -7,7 +7,6 @@ import subprocess
 import json
 import logging
 import time
-import re
 from pathlib import Path
 from datetime import datetime
 
@@ -27,13 +26,12 @@ DEFAULT_CONFIG = {
     "roi_y_start_ratio": 0.0,
     "roi_y_end_ratio": 0.185,
 
-    # Detection
+    # Detection (frame differencing)
     "frame_skip": 6,
-    "match_method": cv2.TM_CCOEFF_NORMED,
-    "confidence_threshold": 0.70,
+    "diff_threshold": 0.03,
+    "diff_noise_threshold": 30,
+    "global_scale_factor": 0.25,
     "cooldown_seconds": 4.0,
-    "use_grayscale": True,
-    "scales": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5],
 
     # Clip Extraction
     "clip_pre_seconds": 3.0,
@@ -43,9 +41,6 @@ DEFAULT_CONFIG = {
     # Metadata
     "metadata_dir": "metadata",
 
-    # Template
-    "templates_dir": "kill_templates",
-    "template_file": "kill_icon.png",
 }
 
 
@@ -57,15 +52,12 @@ class CS2DataPipeline:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self._setup_directories()
         self._setup_logging()
-        self.template = None
 
     def _setup_directories(self):
         """Create required output directories."""
-        for key in ["download_dir", "clips_dir", "metadata_dir", "templates_dir"]:
+        for key in ["download_dir", "clips_dir", "metadata_dir"]:
             dir_path = self.base_dir / self.config[key]
             dir_path.mkdir(parents=True, exist_ok=True)
-
-        (self.base_dir / "frames").mkdir(parents=True, exist_ok=True)
 
     def _setup_logging(self):
         """Configure logging with file and console handlers."""
@@ -82,25 +74,6 @@ class CS2DataPipeline:
             ch.setFormatter(fmt)
             logger.addHandler(fh)
             logger.addHandler(ch)
-
-    def _load_template(self):
-        """Load template image for matching."""
-        template_path = self.base_dir / self.config["templates_dir"] / self.config["template_file"]
-        if not template_path.exists():
-            logger.warning(f"Template not found: {template_path}")
-            return None
-
-        if self.config["use_grayscale"]:
-            self.template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
-        else:
-            self.template = cv2.imread(str(template_path))
-
-        if self.template is None:
-            logger.error(f"Failed to load template: {template_path}")
-            return None
-
-        logger.info(f"Template loaded: {template_path} ({self.template.shape[1]}x{self.template.shape[0]})")
-        return self.template
 
     # =========================================================================
     # Phase 1: Video Download
@@ -167,19 +140,13 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Scan video frames for kill feed matches using template matching.
+        Detect kill moments via frame differencing in the kill feed ROI.
+        Compares ROI pixel changes against global frame changes to filter
+        camera movement and scene transitions.
         Returns list of detection dicts with timestamp, confidence, etc.
         """
         if progress_callback:
             progress_callback("detecting", "Kill anlari tespit ediliyor...")
-
-        if self.template is None:
-            self._load_template()
-        if self.template is None:
-            raise FileNotFoundError(
-                "Template bulunamadi. Lutfen kill_templates/kill_icon.png "
-                "dosyasini olusturun (Web arayuzunden 'Template Olustur' butonunu kullanin)."
-            )
 
         video_path = Path(video_path)
         cap = cv2.VideoCapture(str(video_path))
@@ -201,10 +168,16 @@ class CS2DataPipeline:
         roi_y2 = int(height * self.config["roi_y_end_ratio"])
         logger.info(f"ROI: ({roi_x1},{roi_y1}) -> ({roi_x2},{roi_y2})")
 
+        diff_threshold = self.config["diff_threshold"]
+        noise_threshold = self.config["diff_noise_threshold"]
+        global_scale = self.config["global_scale_factor"]
+
         raw_detections = []
         frame_skip = self.config["frame_skip"]
         frame_number = 0
         analyzed = 0
+        prev_roi_gray = None
+        prev_global_gray = None
 
         while True:
             ret, frame = cap.read()
@@ -212,22 +185,40 @@ class CS2DataPipeline:
                 break
 
             if frame_number % frame_skip == 0:
+                # Extract ROI and convert to grayscale
                 roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-                if self.config["use_grayscale"]:
-                    roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                # Downscale full frame for global change measurement
+                small = cv2.resize(frame, (0, 0), fx=global_scale, fy=global_scale)
+                global_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-                confidence, location, scale = self._match_template_multiscale(roi)
+                if prev_roi_gray is not None:
+                    # ROI difference
+                    roi_diff = cv2.absdiff(roi_gray, prev_roi_gray)
+                    roi_diff[roi_diff < noise_threshold] = 0
+                    roi_change = np.count_nonzero(roi_diff) / roi_diff.size
 
-                if confidence >= self.config["confidence_threshold"]:
-                    timestamp = frame_number / fps
-                    raw_detections.append({
-                        "timestamp": round(timestamp, 2),
-                        "frame_number": frame_number,
-                        "confidence": round(confidence, 4),
-                        "matched_scale": scale,
-                        "matched_location": list(location) if location else None,
-                    })
+                    # Global difference
+                    global_diff = cv2.absdiff(global_gray, prev_global_gray)
+                    global_diff[global_diff < noise_threshold] = 0
+                    global_change = np.count_nonzero(global_diff) / global_diff.size
+
+                    # Kill detected: ROI change above threshold AND significantly
+                    # more than global change (filters camera movement)
+                    if roi_change >= diff_threshold and roi_change > global_change * 2:
+                        timestamp = frame_number / fps
+                        confidence = min(roi_change / diff_threshold, 1.0)
+                        raw_detections.append({
+                            "timestamp": round(timestamp, 2),
+                            "frame_number": frame_number,
+                            "confidence": round(confidence, 4),
+                            "roi_change": round(roi_change, 6),
+                            "global_change": round(global_change, 6),
+                        })
+
+                prev_roi_gray = roi_gray
+                prev_global_gray = global_gray
 
                 analyzed += 1
                 if analyzed % 100 == 0:
@@ -245,33 +236,6 @@ class CS2DataPipeline:
                      f"{len(raw_detections)} ham eslesme, {len(detections)} kill tespit edildi")
 
         return detections
-
-    def _match_template_multiscale(self, roi):
-        """Run template matching across multiple scales. Returns (confidence, location, scale)."""
-        best_confidence = -1
-        best_location = None
-        best_scale = 1.0
-
-        template = self.template
-        roi_h, roi_w = roi.shape[:2]
-
-        for scale in self.config["scales"]:
-            new_w = int(template.shape[1] * scale)
-            new_h = int(template.shape[0] * scale)
-
-            if new_w >= roi_w or new_h >= roi_h or new_w < 5 or new_h < 5:
-                continue
-
-            scaled_template = cv2.resize(template, (new_w, new_h))
-            result = cv2.matchTemplate(roi, scaled_template, self.config["match_method"])
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-            if max_val > best_confidence:
-                best_confidence = max_val
-                best_location = max_loc
-                best_scale = scale
-
-        return best_confidence, best_location, best_scale
 
     def _apply_cooldown(self, detections):
         """Filter detections that are too close together, keeping the highest confidence one."""
@@ -385,7 +349,7 @@ class CS2DataPipeline:
         metadata = {
             "session_id": session_id,
             "created_at": datetime.now().isoformat(),
-            "pipeline_version": "1.0.0",
+            "pipeline_version": "2.0.0",
             "source": {
                 "url": url,
                 "platform": "medal.tv",
@@ -396,17 +360,17 @@ class CS2DataPipeline:
                 "file_size_bytes": file_size,
             },
             "detection_config": {
-                "template_file": self.config["template_file"],
+                "method": "frame_difference",
                 "roi": {
                     "x_start_ratio": self.config["roi_x_start_ratio"],
                     "x_end_ratio": self.config["roi_x_end_ratio"],
                     "y_start_ratio": self.config["roi_y_start_ratio"],
                     "y_end_ratio": self.config["roi_y_end_ratio"],
                 },
-                "confidence_threshold": self.config["confidence_threshold"],
+                "diff_threshold": self.config["diff_threshold"],
+                "diff_noise_threshold": self.config["diff_noise_threshold"],
                 "cooldown_seconds": self.config["cooldown_seconds"],
                 "frame_skip": self.config["frame_skip"],
-                "scales": self.config["scales"],
             },
             "detections": [],
             "annotations": [],
@@ -424,7 +388,8 @@ class CS2DataPipeline:
                 "timestamp_seconds": det["timestamp"],
                 "frame_number": det["frame_number"],
                 "confidence": det["confidence"],
-                "matched_scale": det["matched_scale"],
+                "roi_change": det.get("roi_change", 0),
+                "global_change": det.get("global_change", 0),
                 "clip_file": det.get("clip_file", ""),
                 "clip_start": det.get("clip_start", 0),
                 "clip_end": det.get("clip_end", 0),
@@ -448,126 +413,6 @@ class CS2DataPipeline:
 
         logger.info(f"Metadata kaydedildi: {meta_path}")
         return meta_path
-
-    # =========================================================================
-    # Template Creation Helper
-    # =========================================================================
-
-    def extract_frames_for_template(self, video_path, count=10):
-        """Extract evenly-spaced frames from video for template creation."""
-        video_path = Path(video_path)
-        cap = cv2.VideoCapture(str(video_path))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if total_frames == 0:
-            cap.release()
-            raise RuntimeError("Video bos veya acilamadi")
-
-        frames_dir = self.base_dir / "frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
-
-        # Clean old frames
-        for old in frames_dir.glob("frame_*.png"):
-            old.unlink()
-
-        step = max(1, total_frames // count)
-        saved = []
-
-        for i in range(count):
-            frame_idx = i * step
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Draw ROI overlay
-            h, w = frame.shape[:2]
-            roi_x1 = int(w * self.config["roi_x_start_ratio"])
-            roi_y2 = int(h * self.config["roi_y_end_ratio"])
-            cv2.rectangle(frame, (roi_x1, 0), (w, roi_y2), (0, 255, 0), 2)
-            cv2.putText(frame, "KILL FEED ROI", (roi_x1 + 10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-            path = frames_dir / f"frame_{i:04d}.png"
-            cv2.imwrite(str(path), frame)
-            saved.append(str(path))
-
-        cap.release()
-        logger.info(f"{len(saved)} kare cikarildi: {frames_dir}")
-        return saved
-
-    def create_template_interactive(self, video_path):
-        """
-        Launch OpenCV window for interactive template creation.
-        User navigates frames and crops the kill icon.
-        Returns path to saved template.
-        """
-        video_path = Path(video_path)
-        cap = cv2.VideoCapture(str(video_path))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if total_frames == 0:
-            cap.release()
-            raise RuntimeError("Video bos veya acilamadi")
-
-        window_name = "Template Olustur | A/D: Gezin | SPACE: Sec | Q: Cik"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1280, 720)
-
-        frame_idx = 0
-        template_path = None
-
-        while True:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            display = frame.copy()
-            h, w = display.shape[:2]
-            roi_x1 = int(w * self.config["roi_x_start_ratio"])
-            roi_y2 = int(h * self.config["roi_y_end_ratio"])
-
-            # Draw ROI
-            cv2.rectangle(display, (roi_x1, 0), (w, roi_y2), (0, 255, 0), 2)
-            cv2.putText(display, f"Frame {frame_idx}/{total_frames} | ROI: yesil alan",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(display, "A/D: Gezin | SPACE: Kill ikonunu sec | Q: Cik",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-            cv2.imshow(window_name, display)
-            key = cv2.waitKey(0) & 0xFF
-
-            if key == ord('q') or key == 27:
-                break
-            elif key == ord('d') or key == 83:  # Right
-                frame_idx = min(frame_idx + 30, total_frames - 1)
-            elif key == ord('a') or key == 81:  # Left
-                frame_idx = max(frame_idx - 30, 0)
-            elif key == ord('w'):  # Small step right
-                frame_idx = min(frame_idx + 5, total_frames - 1)
-            elif key == ord('s'):  # Small step left
-                frame_idx = max(frame_idx - 5, 0)
-            elif key == ord(' ') or key == 13:  # SPACE or ENTER
-                cv2.destroyAllWindows()
-                roi = cv2.selectROI("Kill ikonunu secin (mouse ile cizin)", frame)
-                if roi[2] > 0 and roi[3] > 0:
-                    x, y, w_roi, h_roi = [int(v) for v in roi]
-                    cropped = frame[y:y + h_roi, x:x + w_roi]
-
-                    template_dir = self.base_dir / self.config["templates_dir"]
-                    template_dir.mkdir(parents=True, exist_ok=True)
-                    template_path = template_dir / self.config["template_file"]
-                    cv2.imwrite(str(template_path), cropped)
-                    logger.info(f"Template kaydedildi: {template_path} ({w_roi}x{h_roi})")
-                    break
-                else:
-                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow(window_name, 1280, 720)
-
-        cap.release()
-        cv2.destroyAllWindows()
-        return str(template_path) if template_path else None
 
     # =========================================================================
     # Orchestrator
@@ -604,18 +449,6 @@ class CS2DataPipeline:
             logger.info("[1/4] Video indiriliyor...")
             video_path = self.download_video(url, progress_callback)
             result["video_path"] = str(video_path)
-
-            # Check template
-            template_path = self.base_dir / self.config["templates_dir"] / self.config["template_file"]
-            if not template_path.exists():
-                logger.info("Template bulunamadi - interaktif olusturma baslatiliyor...")
-                if progress_callback:
-                    progress_callback("template", "Template olusturma gerekiyor...")
-                created = self.create_template_interactive(video_path)
-                if not created:
-                    raise RuntimeError("Template olusturulamadi. Pipeline durduruluyor.")
-
-            self._load_template()
 
             # Phase 2: Detect
             logger.info("[2/4] Kill anlari tespit ediliyor...")
