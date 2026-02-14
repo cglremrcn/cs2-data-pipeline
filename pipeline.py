@@ -170,11 +170,13 @@ class CS2DataPipeline:
 
         # Step 1: Audio fingerprinting — find personal kill sounds
         audio_dets = []
+        near_misses = []
         audio_path = self._extract_audio(video_path)
         if audio_path:
             try:
-                audio_dets, _ = self._detect_kill_sounds(audio_path, fps)
-                logger.info(f"Audio fingerprint: {len(audio_dets)} kill sounds")
+                audio_dets, near_misses = self._detect_kill_sounds(audio_path, fps)
+                logger.info(f"Audio fingerprint: {len(audio_dets)} candidates, "
+                            f"{len(near_misses)} near-misses")
             except Exception as e:
                 logger.warning(f"Audio analysis failed: {e}")
             finally:
@@ -188,7 +190,32 @@ class CS2DataPipeline:
         verified = self._verify_kill_feed(video_path, audio_dets, fps, width, height)
         logger.info(f"Kill feed verification: {len(verified)}/{len(audio_dets)} confirmed")
 
-        detections = self._apply_cooldown(verified)
+        # Step 2b: Promote near-misses with strong kill feed evidence.
+        # Only consider near-misses that are far from existing verified kills.
+        if near_misses and verified:
+            ver_times = {v["timestamp"] for v in verified}
+            distant = [
+                nm for nm in near_misses
+                if all(abs(nm["timestamp"] - vt) > 5.0 for vt in ver_times)
+            ]
+            if distant:
+                promoted = self._verify_kill_feed(
+                    video_path, distant, fps, width, height
+                )
+                # Filter promoted: must be >4s from verified AND from each other
+                all_times = set(ver_times)
+                final_promoted = []
+                for p in sorted(promoted, key=lambda x: -x["confidence"]):
+                    if all(abs(p["timestamp"] - t) > 5.0 for t in all_times):
+                        final_promoted.append(p)
+                        all_times.add(p["timestamp"])
+                if final_promoted:
+                    logger.info(f"Near-miss promotion: {len(final_promoted)} promoted")
+                    verified.extend(final_promoted)
+                    verified.sort(key=lambda x: x["timestamp"])
+
+        # Use 2.0s cooldown to merge duplicate detections of the same kill
+        detections = self._apply_cooldown(verified, cooldown=2.0)
 
         logger.info(f"Detection complete: {len(detections)} kills")
         return detections
@@ -472,15 +499,20 @@ class CS2DataPipeline:
         """
         Verify audio candidates by detecting NEW kill feed entries in the ROI.
 
-        Compares dark_ratio at candidate time vs 2s before (baseline).
-        Kill feed entries are semi-transparent dark overlays — when a new entry
-        appears, the dark pixel ratio in the ROI increases noticeably.
+        Three complementary signals (any one confirms):
 
-        This rejects:
-          - Audio matches in dark environments (tunnels, shadows) where the
-            game world is already dark but no kill feed is present
-          - Timestamps where kill feed shows old entries from other players'
-            kills (no change in dark_ratio = no new entry)
+        1. Backward delta: dark_ratio increased vs 2s before (baseline).
+           Catches kills where scene transitions from bright to dark overlay.
+
+        2. Forward delta: dark_ratio increased AFTER the audio event (self-
+           baseline at candidate time vs peak at +0.5 to +2.0s). Catches kills
+           where the player moved (e.g. exited a tunnel) right before getting
+           the kill.
+
+        3. Forward text: bright text pixels appeared in a dark ROI within 1s
+           after the audio event, AND the baseline had no text. Catches kills
+           in dark environments where dark_ratio doesn't change but kill feed
+           text becomes visible.
         """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -492,17 +524,19 @@ class CS2DataPipeline:
         roi_y1 = int(height * self.config["roi_y_start_ratio"])
         roi_y2 = int(height * self.config["roi_y_end_ratio"])
 
-        def get_dark_ratio(timestamp):
-            """Get fraction of dark pixels (<60) in the ROI at given timestamp."""
+        def analyze_roi(timestamp):
+            """Get (dark_ratio, white_ratio) for the ROI at given timestamp."""
             frame_num = int(timestamp * fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
             ret, frame = cap.read()
             if not ret:
-                return 0.0
+                return 0.0, 0.0
             gray = cv2.cvtColor(
                 frame[roi_y1:roi_y2, roi_x1:roi_x2], cv2.COLOR_BGR2GRAY
             )
-            return np.count_nonzero(gray < 60) / gray.size
+            dark = np.count_nonzero(gray < 60) / gray.size
+            white = np.count_nonzero(gray > 180) / gray.size
+            return dark, white
 
         verified = []
 
@@ -510,37 +544,84 @@ class CS2DataPipeline:
             ts = det["timestamp"]
 
             # Baseline: 2s before candidate
-            baseline_dark = get_dark_ratio(max(0, ts - 2.0))
+            base_dark, base_white = analyze_roi(max(0, ts - 2.0))
 
-            # Peak dark_ratio at candidate time (check 0, +0.5, +1.0s)
-            best_dark = max(get_dark_ratio(ts + off) for off in [0.0, 0.5, 1.0])
+            # Metrics at candidate time
+            self_dark, self_white = analyze_roi(ts)
 
-            delta = best_dark - baseline_dark
+            # Forward metrics: check 0.5s to 2.0s after candidate
+            fwd_darks = []
+            fwd_whites = []
+            for off in [0.5, 1.0, 1.5, 2.0]:
+                d, w = analyze_roi(ts + off)
+                fwd_darks.append(d)
+                fwd_whites.append(w)
 
-            # Adaptive threshold: when baseline is already dark, require a larger
-            # delta to avoid false positives from game world lighting changes.
-            # Bright baseline (0.0) → threshold ~0.05 (sensitive)
-            # Dark baseline (0.9) → threshold ~0.14 (strict)
-            delta_threshold = 0.05 + baseline_dark * 0.10
+            peak_dark = max(self_dark, *fwd_darks)
+            # For text, check a tighter window (0.5-1.0s) to avoid other kills
+            peak_white_tight = max(fwd_whites[0], fwd_whites[1])  # +0.5, +1.0
+            peak_dark_fwd = max(fwd_darks)
 
-            # Confirm if:
-            #   - Scene was bright, now has dark kill feed overlay
-            #   - OR dark_ratio jumped above the adaptive threshold
-            confirmed = (
-                (baseline_dark < 0.20 and best_dark > 0.25)
-                or delta > delta_threshold
+            # --- Signal 1: Backward delta ---
+            # Dark_ratio increased vs 2s-before baseline (bright → dark).
+            # Exclude peak_dark > 0.96 (pitch-black tunnels/rooms, not kill feed).
+            delta_back = peak_dark - base_dark
+            thresh_back = 0.05 + base_dark * 0.10
+            sig1 = (
+                peak_dark < 0.96
+                and (
+                    (base_dark < 0.20 and peak_dark > 0.25)
+                    or delta_back > thresh_back
+                )
             )
 
+            # --- Signal 2: Forward delta ---
+            # Dark_ratio increased AFTER audio event (self-baseline).
+            # Only fires if scene was reasonably bright at audio time and
+            # became dark enough (kill feed overlay appeared).
+            delta_fwd = peak_dark_fwd - self_dark
+            thresh_fwd = 0.05 + self_dark * 0.10
+            sig2 = (
+                self_dark < 0.50
+                and peak_dark_fwd > 0.25
+                and peak_dark_fwd < 0.96   # exclude pitch-black scene transitions
+                and delta_fwd > thresh_fwd
+            )
+
+            # --- Signal 3: Forward text in dark scene ---
+            # New bright text appeared within 1s after audio event.
+            # Only fires if baseline was dark with NO text (kill feed was empty).
+            # Tighter thresholds avoid noise from dark scene pixel fluctuations.
+            text_delta = peak_white_tight - self_white
+            sig3 = (
+                base_white < 0.001       # baseline had no kill feed text
+                and text_delta > 0.002   # meaningful new text appeared
+                and peak_white_tight > 0.003  # enough text to be kill feed
+                and peak_dark > 0.25     # ROI has dark kill feed bars
+                and delta_fwd >= 0       # kill feed should not make ROI brighter
+            )
+
+            confirmed = sig1 or sig2 or sig3
+            methods = []
+            if sig1:
+                methods.append("back_delta")
+            if sig2:
+                methods.append("fwd_delta")
+            if sig3:
+                methods.append("fwd_text")
+
             if confirmed:
-                det["dark_ratio"] = round(best_dark, 4)
-                det["dark_ratio_delta"] = round(delta, 4)
+                det["dark_ratio"] = round(peak_dark, 4)
+                det["dark_ratio_delta"] = round(delta_back, 4)
                 det["detection_method"] = "audio+killfeed"
                 verified.append(det)
-                logger.info(f"  Confirmed: t={ts:.2f}s, dark={best_dark:.3f}, "
-                            f"delta={delta:+.3f}, base={baseline_dark:.3f}")
+                logger.info(f"  Confirmed: t={ts:.2f}s, dark={peak_dark:.3f}, "
+                            f"d_back={delta_back:+.3f}, d_fwd={delta_fwd:+.3f}, "
+                            f"method={'+'.join(methods)}")
             else:
-                logger.info(f"  Rejected: t={ts:.2f}s, dark={best_dark:.3f}, "
-                            f"delta={delta:+.3f}, base={baseline_dark:.3f}")
+                logger.info(f"  Rejected: t={ts:.2f}s, dark={peak_dark:.3f}, "
+                            f"d_back={delta_back:+.3f}, d_fwd={delta_fwd:+.3f}, "
+                            f"base_w={base_white:.4f}")
 
         cap.release()
         return verified
@@ -549,12 +630,13 @@ class CS2DataPipeline:
     # Common
     # -------------------------------------------------------------------------
 
-    def _apply_cooldown(self, detections):
+    def _apply_cooldown(self, detections, cooldown=None):
         """Filter detections that are too close together, keeping the highest confidence one."""
         if not detections:
             return []
 
-        cooldown = self.config["cooldown_seconds"]
+        if cooldown is None:
+            cooldown = self.config["cooldown_seconds"]
         filtered = [detections[0]]
 
         for det in detections[1:]:
