@@ -760,13 +760,16 @@ class CS2DataPipeline:
 
     def save_kill_frames(self, video_path, detections, session_id, progress_callback=None):
         """
-        Extract frame sequence for each kill: 8 frames before + kill frame + 1 frame after.
+        Extract frame sequence for each kill:
+          - 20 frames before (2.0s, sampled every 0.1s)
+          - kill frame
+          - 5 frames after (0.5s, sampled every 0.1s)
 
         Folder structure:
           clips/<session>/kill_001/
-            before_01.jpg ... before_08.jpg
+            before_20.jpg ... before_01.jpg
             kill.jpg
-            after_01.jpg
+            after_01.jpg ... after_05.jpg
 
         Returns list of kill directory paths.
         """
@@ -783,19 +786,37 @@ class CS2DataPipeline:
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        sample_interval = int(round(fps * 0.1))  # 1 frame every 0.1s (6 frames at 60fps)
         kill_dirs = []
 
-        for i, det in enumerate(detections, 1):
+        # Calculate boundaries so kills don't overlap each other's frames
+        kill_timestamps = [det["timestamp"] for det in detections]
+
+        for i, det in enumerate(detections):
             kill_frame_num = int(det["timestamp"] * fps)
-            kill_dir = session_dir / f"kill_{i:03d}"
+            kill_dir = session_dir / f"kill_{i + 1:03d}"
             kill_dir.mkdir(parents=True, exist_ok=True)
 
-            # Frame numbers: 8 before, kill, 1 after
-            offsets = list(range(-8, 0)) + [0] + [1]
-            saved = 0
+            # Clamp before/after to not cross into adjacent kills
+            prev_kill_frame = int(kill_timestamps[i - 1] * fps) if i > 0 else -1
+            next_kill_frame = int(kill_timestamps[i + 1] * fps) if i < len(detections) - 1 else total_frames
 
-            for offset in offsets:
-                fn = kill_frame_num + offset
+            # Build frame list: up to 20 before, kill, up to 5 after
+            frames_to_save = []
+            for b in range(20, 0, -1):
+                fn = kill_frame_num - b * sample_interval
+                if fn <= prev_kill_frame:
+                    continue  # Would cross into previous kill
+                frames_to_save.append((fn, f"before_{b:02d}.jpg"))
+            frames_to_save.append((kill_frame_num, "kill.jpg"))
+            for a in range(1, 6):
+                fn = kill_frame_num + a * sample_interval
+                if fn >= next_kill_frame:
+                    break  # Would cross into next kill
+                frames_to_save.append((fn, f"after_{a:02d}.jpg"))
+
+            saved = 0
+            for fn, name in frames_to_save:
                 if fn < 0 or fn >= total_frames:
                     continue
 
@@ -803,13 +824,6 @@ class CS2DataPipeline:
                 ret, frame = cap.read()
                 if not ret:
                     continue
-
-                if offset < 0:
-                    name = f"before_{abs(offset):02d}.jpg"
-                elif offset == 0:
-                    name = "kill.jpg"
-                else:
-                    name = f"after_{offset:02d}.jpg"
 
                 cv2.imwrite(str(kill_dir / name), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 saved += 1
