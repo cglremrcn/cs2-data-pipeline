@@ -5,7 +5,7 @@ Automated data processing pipeline that detects kill moments from CS2 (Counter-S
 ## Features
 
 - **Automatic Video Download** — Downloads videos from Medal.tv links (yt-dlp)
-- **Kill Moment Detection** — Detects kill moments from the kill feed using frame difference analysis (no template needed)
+- **Personal Kill Detection** — Detects the player's own kills via audio analysis of the kill confirmation sound (falls back to visual detection)
 - **Smart Clip Extraction** — Cuts 3s before and 3s after each kill with FFmpeg (lossless, audio preserved)
 - **Metadata Generation** — Detailed JSON metadata for each processing session
 - **Web Interface** — User-friendly Flask-based web UI
@@ -33,12 +33,18 @@ Open `http://localhost:5000` in your browser. Paste a Medal.tv URL and click "Ba
 
 ### Kill Detection Algorithm
 
-- **Method:** Frame difference analysis (`cv2.absdiff`)
-- **ROI:** Kill feed region (top-right 30% of the screen)
-- **Filtering:** ROI changes are compared against global frame changes to filter camera movement and scene transitions
-- **Rule:** `roi_change >= threshold AND roi_change > global_change * 2`
-- **Performance:** Every 6th frame is processed (60fps → effective 10fps)
-- **Cooldown:** 4 seconds (prevents duplicate detections of the same kill)
+**Primary: Audio analysis** (personal kills only)
+- Extracts audio from video via FFmpeg
+- Computes spectral flux in the kill confirmation sound frequency band (1800-4500 Hz)
+- Adaptive threshold (median + 2.5x standard deviation) detects kill "ding" sounds
+- Only the local player's kill confirmation sound is analyzed — teammate/enemy kills are ignored
+
+**Fallback: Visual frame differencing** (all kill feed activity)
+- Used when audio is unavailable (no audio track, extraction failure)
+- Monitors kill feed ROI (top-right 30%) for pixel changes
+- Filters camera movement by comparing ROI vs global frame changes
+
+**Cooldown:** 1.0 second (allows rapid multikills while preventing duplicate detections)
 
 ### Clip Extraction
 
