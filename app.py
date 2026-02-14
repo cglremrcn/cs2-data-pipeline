@@ -33,7 +33,7 @@ def process_video():
     url = data.get("url", "").strip()
 
     if not url:
-        return jsonify({"error": "URL gerekli"}), 400
+        return jsonify({"error": "URL is required"}), 400
 
     # Generate session id
     from datetime import datetime
@@ -64,7 +64,7 @@ def get_status(session_id):
     """Get current pipeline status."""
     status = pipeline_status.get(session_id)
     if not status:
-        return jsonify({"error": "Session bulunamadi"}), 404
+        return jsonify({"error": "Session not found"}), 404
 
     result = pipeline_results.get(session_id)
     return jsonify({

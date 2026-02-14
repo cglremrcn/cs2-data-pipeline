@@ -90,7 +90,7 @@ class CS2DataPipeline:
         Returns path to downloaded file.
         """
         if progress_callback:
-            progress_callback("downloading", "Video indiriliyor...")
+            progress_callback("downloading", "Downloading video...")
 
         logger.info(f"Downloading: {url}")
 
@@ -151,14 +151,14 @@ class CS2DataPipeline:
         2. Kill feed verification: reject candidates without visible dark bars
         """
         if progress_callback:
-            progress_callback("detecting", "Kill anlari tespit ediliyor...")
+            progress_callback("detecting", "Detecting kill moments...")
 
         video_path = Path(video_path)
 
         # Get video info
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            raise RuntimeError(f"Video acilamadi: {video_path}")
+            raise RuntimeError(f"Cannot open video: {video_path}")
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -174,23 +174,23 @@ class CS2DataPipeline:
         if audio_path:
             try:
                 audio_dets, _ = self._detect_kill_sounds(audio_path, fps)
-                logger.info(f"Ses fingerprint: {len(audio_dets)} kill sesi")
+                logger.info(f"Audio fingerprint: {len(audio_dets)} kill sounds")
             except Exception as e:
-                logger.warning(f"Ses analizi basarisiz: {e}")
+                logger.warning(f"Audio analysis failed: {e}")
             finally:
                 audio_path.unlink(missing_ok=True)
 
         if not audio_dets:
-            logger.info("Ses bulunamadi")
+            logger.info("No audio detections found")
             return []
 
         # Step 2: Verify audio candidates — is kill feed visible?
         verified = self._verify_kill_feed(video_path, audio_dets, fps, width, height)
-        logger.info(f"Kill feed dogrulama: {len(verified)}/{len(audio_dets)} onaylandi")
+        logger.info(f"Kill feed verification: {len(verified)}/{len(audio_dets)} confirmed")
 
         detections = self._apply_cooldown(verified)
 
-        logger.info(f"Tespit tamamlandi: {len(detections)} kill")
+        logger.info(f"Detection complete: {len(detections)} kills")
         return detections
 
     # -------------------------------------------------------------------------
@@ -216,7 +216,7 @@ class CS2DataPipeline:
                 logger.info(f"Ses cikarildi: {audio_path.name}")
                 return audio_path
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.warning(f"Ses cikarma basarisiz: {e}")
+            logger.warning(f"Audio extraction failed: {e}")
 
         # Cleanup on failure
         if audio_path.exists():
@@ -299,12 +299,12 @@ class CS2DataPipeline:
 
         # Count how many top candidates match the reference well
         cluster_count = sum(1 for i in range(n) if ncc_matrix[ref_idx][i] >= ncc_threshold)
-        logger.info(f"Cluster: {cluster_count}/{top_n} benzer aday")
+        logger.info(f"Cluster: {cluster_count}/{top_n} similar candidates")
 
         # If no clear pattern found, fall back to top candidates by flux
         # (apply cooldown first so they're spread across time)
         if ref_avg < 0.10 or cluster_count < 2:
-            logger.warning("Kill sesi patterni bulunamadi, flux adaylari kullaniliyor")
+            logger.warning("No kill sound pattern found, using flux candidates")
             cooled = self._apply_cooldown(
                 sorted(candidates, key=lambda x: x["timestamp"])
             )
@@ -326,7 +326,7 @@ class CS2DataPipeline:
                 cand["ncc_score"] = round(float(ncc), 4)
                 near_miss.append(cand)
 
-        logger.info(f"Pass 2: {len(final)}/{len(candidates)} aday onaylandi (NCC >= {ncc_threshold})")
+        logger.info(f"Pass 2: {len(final)}/{len(candidates)} candidates confirmed (NCC >= {ncc_threshold})")
         for f in sorted(final, key=lambda x: x["timestamp"]):
             logger.info(f"  -> t={f['timestamp']:.2f}s, NCC={f['ncc_score']:.3f}, flux={f['audio_flux']:.2f}")
         if near_miss:
@@ -482,7 +482,7 @@ class CS2DataPipeline:
         """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            logger.warning("Kill feed dogrulama icin video acilamadi")
+            logger.warning("Cannot open video for kill feed verification")
             return audio_dets  # Can't verify, return all
 
         # Calculate ROI pixel coordinates
@@ -568,7 +568,7 @@ class CS2DataPipeline:
         Returns list of kill directory paths.
         """
         if progress_callback:
-            progress_callback("cutting", "Kill frame'leri kaydediliyor...")
+            progress_callback("cutting", "Saving kill frames...")
 
         video_path = Path(video_path)
         session_dir = self.base_dir / self.config["clips_dir"] / session_id
@@ -576,7 +576,7 @@ class CS2DataPipeline:
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            raise RuntimeError(f"Video acilamadi: {video_path}")
+            raise RuntimeError(f"Cannot open video: {video_path}")
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -625,10 +625,10 @@ class CS2DataPipeline:
             kill_dirs.append(kill_dir)
             det["frame_dir"] = str(kill_dir.relative_to(self.base_dir))
             det["frame_file"] = str((kill_dir / "kill.jpg").relative_to(self.base_dir))
-            logger.info(f"Kill {i}: {saved} frame kaydedildi (t={det['timestamp']:.2f}s)")
+            logger.info(f"Kill {i}: {saved} frames saved (t={det['timestamp']:.2f}s)")
 
         cap.release()
-        logger.info(f"Toplam {len(kill_dirs)} kill, {len(kill_dirs) * 10} frame")
+        logger.info(f"Total {len(kill_dirs)} kills, {len(kill_dirs) * 10} frames")
         return kill_dirs
 
     # =========================================================================
@@ -717,7 +717,7 @@ class CS2DataPipeline:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"Metadata kaydedildi: {meta_path}")
+        logger.info(f"Metadata saved: {meta_path}")
         return meta_path
 
     # =========================================================================
@@ -752,23 +752,23 @@ class CS2DataPipeline:
 
         try:
             # Phase 1: Download
-            logger.info("[1/4] Video indiriliyor...")
+            logger.info("[1/4] Downloading video...")
             video_path = self.download_video(url, progress_callback)
             result["video_path"] = str(video_path)
 
             # Phase 2: Detect
-            logger.info("[2/4] Kill anlari tespit ediliyor...")
+            logger.info("[2/4] Detecting kill moments...")
             detections = self.detect_kills(video_path, progress_callback)
             result["kills_detected"] = len(detections)
 
             if not detections:
-                logger.warning("Hicbir kill tespit edilemedi.")
+                logger.warning("No kills detected.")
                 if progress_callback:
-                    progress_callback("done", "Kill tespit edilemedi.")
+                    progress_callback("done", "No kills detected.")
                 result["status"] = "no_kills"
             else:
                 # Phase 3: Save kill frames
-                logger.info(f"[3/4] {len(detections)} kill frame kaydediliyor...")
+                logger.info(f"[3/4] Saving frames for {len(detections)} kills...")
                 kill_dirs = self.save_kill_frames(video_path, detections, session_id, progress_callback)
                 result["clips_created"] = len(kill_dirs)
                 result["clip_paths"] = [
@@ -777,9 +777,9 @@ class CS2DataPipeline:
                 ]
 
                 # Phase 4: Metadata
-                logger.info("[4/4] Metadata olusturuluyor...")
+                logger.info("[4/4] Generating metadata...")
                 if progress_callback:
-                    progress_callback("metadata", "Metadata olusturuluyor...")
+                    progress_callback("metadata", "Generating metadata...")
                 meta_path = self.generate_metadata(
                     video_path, url, detections, kill_dirs, session_id
                 )
@@ -790,17 +790,17 @@ class CS2DataPipeline:
             result["processing_time"] = round(elapsed, 2)
 
             logger.info("=" * 60)
-            logger.info(f"Pipeline tamamlandi! ({elapsed:.1f}s)")
-            logger.info(f"  Kill tespit: {result['kills_detected']}")
-            logger.info(f"  Frame kaydedildi: {result['clips_created']}")
+            logger.info(f"Pipeline complete! ({elapsed:.1f}s)")
+            logger.info(f"  Kills detected: {result['kills_detected']}")
+            logger.info(f"  Frames saved: {result['clips_created']}")
             logger.info("=" * 60)
 
             if progress_callback:
-                progress_callback("done", f"Tamamlandi! {result['kills_detected']} kill, "
-                                          f"{result['clips_created']} frame.")
+                progress_callback("done", f"Done! {result['kills_detected']} kills, "
+                                          f"{result['clips_created']} frames.")
 
         except Exception as e:
-            logger.error(f"Pipeline hatasi: {e}", exc_info=True)
+            logger.error(f"Pipeline error: {e}", exc_info=True)
             result["status"] = "error"
             result["error"] = str(e)
             result["processing_time"] = round(time.time() - start_time, 2)
