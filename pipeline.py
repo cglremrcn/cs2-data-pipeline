@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
 
     # Detection
     "frame_skip": 6,
-    "cooldown_seconds": 0.5,
+    "cooldown_seconds": 1.0,
 
     # Audio kill sound detection
     "kill_sound_freq_low": 1800,
@@ -181,11 +181,12 @@ class CS2DataPipeline:
 
         # Step 1: Audio fingerprinting — find personal kill sounds
         audio_dets = []
+        near_misses = []
         audio_path = self._extract_audio(video_path)
         if audio_path:
             try:
-                audio_dets = self._detect_kill_sounds(audio_path, fps)
-                logger.info(f"Ses fingerprint: {len(audio_dets)} kill sesi")
+                audio_dets, near_misses = self._detect_kill_sounds(audio_path, fps)
+                logger.info(f"Ses fingerprint: {len(audio_dets)} kill sesi, {len(near_misses)} near-miss")
             except Exception as e:
                 logger.warning(f"Ses analizi basarisiz: {e}")
             finally:
@@ -195,11 +196,26 @@ class CS2DataPipeline:
             logger.info("Ses bulunamadi")
             return []
 
-        # Step 2: Verify each audio candidate — is kill feed visible?
+        # Step 2: Verify audio candidates — is kill feed visible?
         verified = self._verify_kill_feed(video_path, audio_dets, fps, width, height)
         logger.info(f"Kill feed dogrulama: {len(verified)}/{len(audio_dets)} onaylandi")
 
         detections = self._apply_cooldown(verified)
+
+        # Step 3: Check near-misses — audio almost caught these, verify with kill feed
+        if near_misses:
+            cooldown = self.config["cooldown_seconds"]
+            verified_near = self._verify_kill_feed(video_path, near_misses, fps, width, height)
+            for nm in verified_near:
+                already_covered = any(
+                    abs(nm["timestamp"] - d["timestamp"]) < cooldown
+                    for d in detections
+                )
+                if not already_covered:
+                    nm["detection_method"] = "near_miss+killfeed"
+                    detections.append(nm)
+                    logger.info(f"  Near-miss eklendi: t={nm['timestamp']:.2f}s, NCC={nm['ncc_score']:.3f}")
+            detections.sort(key=lambda x: x["timestamp"])
 
         logger.info(f"Tespit tamamlandi: {len(detections)} kill")
         return detections
@@ -296,7 +312,7 @@ class CS2DataPipeline:
         audio /= 32768.0
 
         if len(audio) == 0:
-            return []
+            return [], []
 
         # Bandpass filter full audio to kill sound frequency range
         filtered = self._bandpass_filter(audio, rate)
@@ -304,13 +320,13 @@ class CS2DataPipeline:
         # ---- Pass 1: Spectral flux candidates (intentionally over-detect) ----
         candidates = self._spectral_flux_candidates(audio, rate, fps)
         if not candidates:
-            return []
+            return [], []
 
         logger.info(f"Pass 1: {len(candidates)} spectral flux adayi")
 
         # If very few candidates, skip fingerprinting
         if len(candidates) <= 2:
-            return candidates
+            return candidates, []
 
         # ---- Auto-calibrate: find kill sound reference via pairwise NCC ----
         snippet_ms = self.config["fingerprint_snippet_ms"]
@@ -359,7 +375,7 @@ class CS2DataPipeline:
                 sorted(candidates, key=lambda x: x["timestamp"])
             )
             cooled.sort(key=lambda x: x["audio_flux"], reverse=True)
-            return cooled[:8]
+            return cooled[:8], []
 
         # ---- Pass 2: Score ALL candidates against single best reference ----
         final = []
@@ -371,16 +387,19 @@ class CS2DataPipeline:
                 cand["confidence"] = round(float(ncc), 4)
                 cand["ncc_score"] = round(float(ncc), 4)
                 final.append(cand)
-            elif ncc >= ncc_threshold * 0.7:
-                near_miss.append((cand["timestamp"], ncc))
+            elif ncc >= ncc_threshold * 0.6:
+                cand["confidence"] = round(float(ncc), 4)
+                cand["ncc_score"] = round(float(ncc), 4)
+                near_miss.append(cand)
 
         logger.info(f"Pass 2: {len(final)}/{len(candidates)} aday onaylandi (NCC >= {ncc_threshold})")
         for f in sorted(final, key=lambda x: x["timestamp"]):
             logger.info(f"  -> t={f['timestamp']:.2f}s, NCC={f['ncc_score']:.3f}, flux={f['audio_flux']:.2f}")
         if near_miss:
-            logger.info(f"  Near-miss ({len(near_miss)}): {', '.join(f't={t:.2f}s NCC={n:.3f}' for t,n in near_miss)}")
+            nm_str = ", ".join(f"t={c['timestamp']:.2f}s NCC={c['ncc_score']:.3f}" for c in near_miss)
+            logger.info(f"  Near-miss ({len(near_miss)}): {nm_str}")
 
-        return sorted(final, key=lambda x: x["timestamp"])
+        return sorted(final, key=lambda x: x["timestamp"]), sorted(near_miss, key=lambda x: x["timestamp"])
 
     def _bandpass_filter(self, audio, rate):
         """FFT-based bandpass filter to kill sound frequency range."""
