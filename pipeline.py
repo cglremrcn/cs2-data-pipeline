@@ -760,42 +760,68 @@ class CS2DataPipeline:
 
     def save_kill_frames(self, video_path, detections, session_id, progress_callback=None):
         """
-        Extract and save the exact frame at each kill timestamp as JPG.
-        Returns list of saved frame paths.
+        Extract frame sequence for each kill: 8 frames before + kill frame + 1 frame after.
+
+        Folder structure:
+          clips/<session>/kill_001/
+            before_01.jpg ... before_08.jpg
+            kill.jpg
+            after_01.jpg
+
+        Returns list of kill directory paths.
         """
         if progress_callback:
             progress_callback("cutting", "Kill frame'leri kaydediliyor...")
 
         video_path = Path(video_path)
-        frame_dir = self.base_dir / self.config["clips_dir"] / session_id
-        frame_dir.mkdir(parents=True, exist_ok=True)
+        session_dir = self.base_dir / self.config["clips_dir"] / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Video acilamadi: {video_path}")
 
         fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_paths = []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        kill_dirs = []
 
         for i, det in enumerate(detections, 1):
-            frame_num = int(det["timestamp"] * fps)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            ret, frame = cap.read()
-            if not ret:
-                logger.warning(f"Frame okunamadi: t={det['timestamp']:.2f}s")
-                continue
+            kill_frame_num = int(det["timestamp"] * fps)
+            kill_dir = session_dir / f"kill_{i:03d}"
+            kill_dir.mkdir(parents=True, exist_ok=True)
 
-            frame_name = f"kill_{i:03d}.jpg"
-            output_path = frame_dir / frame_name
-            cv2.imwrite(str(output_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            # Frame numbers: 8 before, kill, 1 after
+            offsets = list(range(-8, 0)) + [0] + [1]
+            saved = 0
 
-            frame_paths.append(output_path)
-            det["frame_file"] = str(output_path.relative_to(self.base_dir))
-            logger.info(f"Frame kaydedildi: {frame_name} (t={det['timestamp']:.2f}s)")
+            for offset in offsets:
+                fn = kill_frame_num + offset
+                if fn < 0 or fn >= total_frames:
+                    continue
+
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                if offset < 0:
+                    name = f"before_{abs(offset):02d}.jpg"
+                elif offset == 0:
+                    name = "kill.jpg"
+                else:
+                    name = f"after_{offset:02d}.jpg"
+
+                cv2.imwrite(str(kill_dir / name), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                saved += 1
+
+            kill_dirs.append(kill_dir)
+            det["frame_dir"] = str(kill_dir.relative_to(self.base_dir))
+            det["frame_file"] = str((kill_dir / "kill.jpg").relative_to(self.base_dir))
+            logger.info(f"Kill {i}: {saved} frame kaydedildi (t={det['timestamp']:.2f}s)")
 
         cap.release()
-        logger.info(f"Toplam {len(frame_paths)}/{len(detections)} frame kaydedildi")
-        return frame_paths
+        logger.info(f"Toplam {len(kill_dirs)} kill, {len(kill_dirs) * 10} frame")
+        return kill_dirs
 
     def _ffmpeg_cut(self, video_path, start, end, output_path):
         """Execute a single FFmpeg cut with -c copy (no re-encoding)."""
@@ -975,16 +1001,19 @@ class CS2DataPipeline:
             else:
                 # Phase 3: Save kill frames
                 logger.info(f"[3/4] {len(detections)} kill frame kaydediliyor...")
-                frame_paths = self.save_kill_frames(video_path, detections, session_id, progress_callback)
-                result["clips_created"] = len(frame_paths)
-                result["clip_paths"] = [str(p.relative_to(self.base_dir)).replace("\\", "/") for p in frame_paths]
+                kill_dirs = self.save_kill_frames(video_path, detections, session_id, progress_callback)
+                result["clips_created"] = len(kill_dirs)
+                result["clip_paths"] = [
+                    str((d / "kill.jpg").relative_to(self.base_dir)).replace("\\", "/")
+                    for d in kill_dirs
+                ]
 
                 # Phase 4: Metadata
                 logger.info("[4/4] Metadata olusturuluyor...")
                 if progress_callback:
                     progress_callback("metadata", "Metadata olusturuluyor...")
                 meta_path = self.generate_metadata(
-                    video_path, url, detections, frame_paths, session_id
+                    video_path, url, detections, kill_dirs, session_id
                 )
                 result["metadata_path"] = str(meta_path.relative_to(self.base_dir)).replace("\\", "/")
                 result["status"] = "completed"
