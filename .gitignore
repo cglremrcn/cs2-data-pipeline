@@ -29,6 +29,10 @@ env/
 *.swp
 *.swo
 
+# Claude
+CLAUDE.md
+.claude/
+
 # Logs
 *.log
 pipeline.log
