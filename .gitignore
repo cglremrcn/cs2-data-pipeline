@@ -1,7 +1,6 @@
 # Video and media files
 downloads/
 clips/
-frames/
 *.mp4
 *.avi
 *.mkv
@@ -40,7 +39,3 @@ pipeline.log
 # OS
 Thumbs.db
 .DS_Store
-
-# Template images (user-specific)
-kill_templates/*.png
-!kill_templates/.gitkeep
