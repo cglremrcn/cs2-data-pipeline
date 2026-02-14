@@ -690,7 +690,9 @@ class CS2DataPipeline:
 
     def cut_clips(self, video_path, detections, session_id, progress_callback=None):
         """
-        Cut 6-second clips around each kill moment using FFmpeg.
+        Cut clips around kill moments using FFmpeg.
+        Merges overlapping clip windows into single clips when kills are
+        close together (within clip_pre + clip_post seconds).
         Returns list of created clip paths.
         """
         if progress_callback:
@@ -702,25 +704,45 @@ class CS2DataPipeline:
 
         # Get video duration for boundary clamping
         duration = self._get_video_duration(video_path)
+        pre = self.config["clip_pre_seconds"]
+        post = self.config["clip_post_seconds"]
+
+        # Group detections into merged clip windows
+        groups = []
+        for det in detections:
+            start = max(0, det["timestamp"] - pre)
+            end = min(duration, det["timestamp"] + post)
+
+            if groups and start <= groups[-1]["end"]:
+                # Overlapping — extend current group
+                groups[-1]["end"] = end
+                groups[-1]["detections"].append(det)
+            else:
+                groups.append({"start": start, "end": end, "detections": [det]})
+
         clip_paths = []
 
-        for i, det in enumerate(detections, 1):
-            start = max(0, det["timestamp"] - self.config["clip_pre_seconds"])
-            end = min(duration, det["timestamp"] + self.config["clip_post_seconds"])
+        for i, group in enumerate(groups, 1):
+            start = round(group["start"], 2)
+            end = round(group["end"], 2)
             clip_name = f"cs2_clip_{i:03d}.mp4"
             output_path = clip_dir / clip_name
 
             success = self._ffmpeg_cut(video_path, start, end, output_path)
             if success:
                 clip_paths.append(output_path)
-                det["clip_file"] = str(output_path.relative_to(self.base_dir))
-                det["clip_start"] = round(start, 2)
-                det["clip_end"] = round(end, 2)
-                logger.info(f"Klip kesildi: {clip_name} ({start:.1f}s - {end:.1f}s)")
+                clip_rel = str(output_path.relative_to(self.base_dir))
+                for det in group["detections"]:
+                    det["clip_file"] = clip_rel
+                    det["clip_start"] = start
+                    det["clip_end"] = end
+                kills = len(group["detections"])
+                label = f"{kills} kill" if kills > 1 else ""
+                logger.info(f"Klip kesildi: {clip_name} ({start:.1f}s - {end:.1f}s) {label}".rstrip())
             else:
                 logger.warning(f"Klip kesilemedi: {clip_name}")
 
-        logger.info(f"Toplam {len(clip_paths)}/{len(detections)} klip olusturuldu")
+        logger.info(f"Toplam {len(clip_paths)} klip olusturuldu ({len(detections)} kill)")
         return clip_paths
 
     def _ffmpeg_cut(self, video_path, start, end, output_path):
