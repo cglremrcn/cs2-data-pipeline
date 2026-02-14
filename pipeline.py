@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
 
     # Audio fingerprinting (auto-calibration)
     "fingerprint_snippet_ms": 250,
-    "fingerprint_ncc_threshold": 0.3,
+    "fingerprint_ncc_threshold": 0.28,
     "fingerprint_top_n": 15,
 
     # Clip Extraction
