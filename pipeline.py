@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
 
     # Audio fingerprinting (auto-calibration)
     "fingerprint_snippet_ms": 250,
-    "fingerprint_ncc_threshold": 0.45,
+    "fingerprint_ncc_threshold": 0.35,
     "fingerprint_top_n": 15,
 
     # Clip Extraction
@@ -379,7 +379,7 @@ class CS2DataPipeline:
 
         # If no clear pattern found, fall back to top candidates by flux
         # (apply cooldown first so they're spread across time)
-        if ref_avg < 0.15 or cluster_count < 2:
+        if ref_avg < 0.10 or cluster_count < 2:
             logger.warning("Kill sesi patterni bulunamadi, flux adaylari kullaniliyor")
             cooled = self._apply_cooldown(
                 sorted(candidates, key=lambda x: x["timestamp"])
@@ -507,24 +507,37 @@ class CS2DataPipeline:
 
     def _compute_ncc(self, a, b):
         """
-        Compute NCC using magnitude spectrum (phase-invariant).
-        Compares frequency content rather than raw waveform, making it
-        robust to timing misalignment and compression artifacts.
+        Compute NCC with ±30ms shift tolerance via FFT cross-correlation.
+        Time-domain NCC is discriminating in narrow bands (unlike magnitude
+        spectrum NCC which is too permissive).
         """
-        # Magnitude spectra — phase-invariant, no shift tolerance needed
-        spec_a = np.abs(np.fft.rfft(a))
-        spec_b = np.abs(np.fft.rfft(b))
+        a = a - np.mean(a)
+        b = b - np.mean(b)
 
-        spec_a = spec_a - np.mean(spec_a)
-        spec_b = spec_b - np.mean(spec_b)
-
-        norm_a = np.linalg.norm(spec_a)
-        norm_b = np.linalg.norm(spec_b)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
 
         if norm_a < 1e-10 or norm_b < 1e-10:
             return 0.0
 
-        return float(np.dot(spec_a, spec_b) / (norm_a * norm_b))
+        n = len(a)
+        max_shift = int(0.030 * 22050)  # ±30ms at 22050Hz
+
+        fft_size = 1
+        while fft_size < 2 * n:
+            fft_size *= 2
+
+        fa = np.fft.rfft(a, fft_size)
+        fb = np.fft.rfft(b, fft_size)
+        xcorr = np.fft.irfft(fa * np.conj(fb), fft_size)
+
+        # Only check shifts within ±max_shift
+        valid = np.concatenate([
+            xcorr[:min(max_shift + 1, len(xcorr))],
+            xcorr[-min(max_shift, len(xcorr)):]
+        ])
+
+        return float(np.max(valid) / (norm_a * norm_b))
 
     # -------------------------------------------------------------------------
     # Visual kill detection (fallback)
