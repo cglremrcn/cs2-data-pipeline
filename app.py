@@ -12,7 +12,7 @@ from pipeline import CS2DataPipeline
 
 app = Flask(__name__)
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 pipeline = CS2DataPipeline(base_dir=BASE_DIR)
 
 # Store pipeline status per session

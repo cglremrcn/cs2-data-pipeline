@@ -53,7 +53,7 @@ class CS2DataPipeline:
     """End-to-end pipeline for CS2 kill moment detection and clip extraction."""
 
     def __init__(self, base_dir=None, config=None):
-        self.base_dir = Path(base_dir) if base_dir else Path(__file__).parent
+        self.base_dir = Path(base_dir).resolve() if base_dir else Path(__file__).resolve().parent
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self._setup_directories()
         self._setup_logging()
@@ -718,8 +718,16 @@ class CS2DataPipeline:
                 if not ret:
                     continue
 
-                cv2.imwrite(str(kill_dir / name), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                saved += 1
+                out_path = str(kill_dir / name)
+                ok = cv2.imwrite(out_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok:
+                    # Fallback for paths with non-ASCII characters (Windows)
+                    success, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if success:
+                        Path(out_path).write_bytes(buf.tobytes())
+                        ok = True
+                if ok:
+                    saved += 1
 
             kill_dirs.append(kill_dir)
             det["frame_dir"] = str(kill_dir.relative_to(self.base_dir))
