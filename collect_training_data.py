@@ -1,25 +1,32 @@
 """
-Collect training data from Medal.tv videos for the CS2 kill sound classifier.
+Automatically collect training data from Medal.tv for the CS2 kill sound classifier.
 
-Reads training_videos.json with URL + expected_kills pairs, downloads each video,
-extracts audio, finds top-N peaks (N = expected kills) as positive samples, and
-collects negative samples from non-kill regions. Saves features to
-training_data/features.npz and retrains the model.
+Searches Medal.tv API for "cs2 1k", "cs2 2k", ... "cs2 5k" clips, downloads them,
+uses the video title's kill count as ground truth, extracts audio features, and
+retrains the model.
 
 Usage:
-    1. Search Medal.tv for "cs2 3k", "cs2 5k", etc.
-    2. Add URLs to training_videos.json:
-       [{"url": "https://medal.tv/.../abc", "expected_kills": 3}, ...]
-    3. Run: python collect_training_data.py
+    python collect_training_data.py              # default: 10 videos per query
+    python collect_training_data.py --per-query 20
+    python collect_training_data.py --queries "cs2 3k" "cs2 ace"
 """
 
+import re
 import json
 import wave
+import time
 import logging
+import argparse
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,32 +43,139 @@ HOP_MS = 50
 HOP_SAMPLES = int(HOP_MS / 1000.0 * RATE)
 NEG_MIN_DISTANCE_S = 1.5
 
+MEDAL_API_BASE = "https://developers.medal.tv/v1"
 
-def load_video_list():
-    """Load training_videos.json."""
-    path = BASE_DIR / "training_videos.json"
-    if not path.exists():
-        logger.error(
-            "training_videos.json not found. Create it with:\n"
-            '[{"url": "https://medal.tv/.../abc", "expected_kills": 3}]'
-        )
+# Kill count patterns in video titles
+KILL_PATTERNS = {
+    "1k": 1, "2k": 2, "3k": 3, "4k": 4, "5k": 5,
+    "ace": 5,
+    "1 kill": 1, "2 kill": 2, "3 kill": 3, "4 kill": 4, "5 kill": 5,
+    "1 kills": 1, "2 kills": 2, "3 kills": 3, "4 kills": 4, "5 kills": 5,
+}
+
+# Default search queries
+DEFAULT_QUERIES = ["cs2 1k", "cs2 2k", "cs2 3k", "cs2 4k", "cs2 5k", "cs2 ace"]
+
+# State file to track processed videos
+STATE_FILE = BASE_DIR / "training_data" / "processed_videos.json"
+
+
+def get_api_key():
+    """Get or generate a Medal.tv public API key."""
+    key_path = BASE_DIR / "training_data" / "medal_api_key.txt"
+
+    # Check saved key
+    if key_path.exists():
+        key = key_path.read_text().strip()
+        if key:
+            return key
+
+    # Generate new key
+    if requests is None:
+        logger.info("Generating API key with subprocess (requests not installed)...")
+        try:
+            result = subprocess.run(
+                ["curl", "-s", f"{MEDAL_API_BASE}/generate_public_key"],
+                capture_output=True, text=True, timeout=15,
+            )
+            # Response is just the key text
+            key = result.stdout.strip()
+            # Try to parse as JSON if wrapped
+            try:
+                data = json.loads(key)
+                key = data.get("key", data.get("apiKey", key))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        except Exception as e:
+            logger.error(f"Failed to generate API key: {e}")
+            return None
+    else:
+        try:
+            resp = requests.get(f"{MEDAL_API_BASE}/generate_public_key", timeout=15)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                key = data.get("key", data.get("apiKey", resp.text.strip()))
+            except (json.JSONDecodeError, ValueError):
+                key = resp.text.strip()
+        except Exception as e:
+            logger.error(f"Failed to generate API key: {e}")
+            return None
+
+    if key:
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_text(key)
+        logger.info(f"API key saved to {key_path}")
+    return key
+
+
+def search_medal(query, api_key, limit=10, offset=0):
+    """Search Medal.tv API for clips. Returns list of clip dicts."""
+    url = f"{MEDAL_API_BASE}/search?text={quote(query)}&limit={limit}&offset={offset}"
+    headers = {"Authorization": api_key}
+
+    try:
+        if requests:
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            result = subprocess.run(
+                ["curl", "-s", "-H", f"Authorization: {api_key}", url],
+                capture_output=True, text=True, timeout=15,
+            )
+            data = json.loads(result.stdout)
+
+        clips = data.get("contentObjects", [])
+        return clips
+
+    except Exception as e:
+        logger.error(f"Medal API search failed for '{query}': {e}")
         return []
 
-    with open(path, "r", encoding="utf-8") as f:
-        videos = json.load(f)
 
-    valid = []
-    for v in videos:
-        if "url" not in v or "expected_kills" not in v:
-            logger.warning(f"Skipping invalid entry: {v}")
-            continue
-        if v["expected_kills"] < 1:
-            logger.warning(f"Skipping entry with 0 kills: {v['url']}")
-            continue
-        valid.append(v)
+def parse_kill_count(title, query):
+    """
+    Extract expected kill count from video title or search query.
+    Returns int or None if can't determine.
+    """
+    title_lower = title.lower()
 
-    logger.info(f"Loaded {len(valid)} videos from training_videos.json")
-    return valid
+    # Check title for kill patterns
+    for pattern, count in KILL_PATTERNS.items():
+        if pattern in title_lower:
+            return count
+
+    # Fallback: extract from query
+    query_lower = query.lower()
+    for pattern, count in KILL_PATTERNS.items():
+        if pattern in query_lower:
+            return count
+
+    return None
+
+
+def load_processed_videos():
+    """Load set of already processed video content IDs."""
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return set()
+
+
+def save_processed_videos(processed):
+    """Save set of processed video content IDs."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(processed), f)
+
+
+def build_medal_url(content_id):
+    """Build a Medal.tv clip URL from content ID."""
+    return f"https://medal.tv/clips/{content_id}"
 
 
 def download_video(url):
@@ -92,15 +206,15 @@ def download_video(url):
         if mp4_files:
             return mp4_files[-1]
     except subprocess.CalledProcessError as e:
-        logger.error(f"yt-dlp failed for {url}: {e.stderr[:300]}")
+        logger.error(f"yt-dlp failed: {e.stderr[:300]}")
     except subprocess.TimeoutExpired:
-        logger.error(f"Download timed out for {url}")
+        logger.error(f"Download timed out")
 
     return None
 
 
 def extract_audio(video_path):
-    """Extract mono WAV audio from video. Returns (samples, rate) or None."""
+    """Extract mono WAV audio from video. Returns numpy array or None."""
     audio_path = video_path.parent / (video_path.stem + "_collect_audio.wav")
     cmd = [
         "ffmpeg", "-y",
@@ -137,7 +251,6 @@ def find_top_peaks_ml(audio, n_peaks):
         if not clf.is_ready:
             return None
 
-        # Sliding window
         windows = []
         timestamps = []
         for start in range(0, len(audio) - WINDOW_SAMPLES, HOP_SAMPLES):
@@ -147,32 +260,27 @@ def find_top_peaks_ml(audio, n_peaks):
         if not windows:
             return None
 
-        # Extract features
         features = []
         for i in range(len(windows)):
             feat = extract_features_with_context(windows, RATE, i)
             features.append(feat)
         features = np.array(features)
 
-        # Predict
         proba = clf.predict_proba(features)
 
-        # Find peaks
-        peaks, props = find_peaks(proba, height=0.15, distance=10, prominence=0.10)
+        peaks, _ = find_peaks(proba, height=0.15, distance=10, prominence=0.10)
         if len(peaks) == 0:
             return None
 
-        # Sort by probability and take top-N
         peak_probs = [(peaks[i], float(proba[peaks[i]])) for i in range(len(peaks))]
         peak_probs.sort(key=lambda x: -x[1])
 
         top = peak_probs[:n_peaks]
         result = [(timestamps[idx], prob) for idx, prob in top]
-        result.sort(key=lambda x: x[0])  # sort by time
-
+        result.sort(key=lambda x: x[0])
         return result
 
-    except (ImportError, Exception) as e:
+    except Exception as e:
         logger.info(f"ML peak detection not available: {e}")
         return None
 
@@ -181,8 +289,8 @@ def find_top_peaks_spectral(audio, n_peaks):
     """Find top-N peaks using spectral flux (fallback when no ML model)."""
     from scipy.signal import find_peaks
 
-    win_size = int(50 / 1000 * RATE)  # 50ms
-    hop_size = int(10 / 1000 * RATE)  # 10ms
+    win_size = int(50 / 1000 * RATE)
+    hop_size = int(10 / 1000 * RATE)
     freq_low, freq_high = 1800, 4500
 
     hann = np.hanning(win_size)
@@ -208,32 +316,23 @@ def find_top_peaks_spectral(audio, n_peaks):
         return None
 
     flux_arr = np.array(flux_list)
-
-    # Find peaks
     min_dist = int(0.5 * RATE / hop_size)
-    peaks, props = find_peaks(flux_arr, distance=min_dist, prominence=np.std(flux_arr) * 0.5)
+    peaks, _ = find_peaks(flux_arr, distance=min_dist, prominence=np.std(flux_arr) * 0.5)
 
     if len(peaks) == 0:
         return None
 
-    # Sort by flux and take top-N
     peak_fluxes = [(peaks[i], float(flux_arr[peaks[i]])) for i in range(len(peaks))]
     peak_fluxes.sort(key=lambda x: -x[1])
 
     top = peak_fluxes[:n_peaks]
     result = [(time_list[idx], flux) for idx, flux in top]
     result.sort(key=lambda x: x[0])
-
     return result
 
 
 def extract_samples(audio, kill_timestamps, n_kills):
-    """
-    Extract positive and negative feature samples from audio.
-
-    Positive: windows centered on kill timestamps + augmented copies.
-    Negative: random windows far from any kill.
-    """
+    """Extract positive and negative feature samples from audio."""
     from audio_classifier import extract_features, extract_features_with_context, augment_sample
 
     total_samples = len(audio)
@@ -253,7 +352,6 @@ def extract_samples(audio, kill_timestamps, n_kills):
 
         window = audio[start:end]
 
-        # Context windows for delta-MFCC
         context_windows = []
         for offset in [-1, 0, 1]:
             ctx_start = start + offset * HOP_SAMPLES
@@ -266,7 +364,6 @@ def extract_samples(audio, kill_timestamps, n_kills):
         feat = extract_features_with_context(context_windows, RATE, 1)
         pos_features.append(feat)
 
-        # Augmented copies
         augmented = augment_sample(window, RATE)
         for aug_window, _ in augmented:
             aug_feat = extract_features(aug_window, RATE)
@@ -293,8 +390,6 @@ def extract_samples(audio, kill_timestamps, n_kills):
             continue
 
         window = audio[start:end]
-
-        # Skip silent windows
         if np.sqrt(np.mean(window ** 2)) < 0.005:
             continue
 
@@ -324,7 +419,6 @@ def save_collected_data(all_pos, all_neg):
     new_X = np.array(all_pos + all_neg)
     new_y = np.array([1] * len(all_pos) + [0] * len(all_neg))
 
-    # Append to existing data if present
     if npz_path.exists():
         try:
             existing = np.load(npz_path)
@@ -351,16 +445,13 @@ def retrain_model():
 
         logger.info("Retraining model with all available data...")
 
-        # Get metadata-based labels
         labels = bootstrap_labels(BASE_DIR)
 
-        # Extract metadata-based features
         if labels:
             X_meta, y_meta = extract_training_data(labels, BASE_DIR)
         else:
             X_meta, y_meta = np.array([]), np.array([])
 
-        # Load collected data
         npz_path = BASE_DIR / "training_data" / "features.npz"
         if npz_path.exists():
             collected = np.load(npz_path)
@@ -370,7 +461,6 @@ def retrain_model():
         else:
             X_coll, y_coll = np.array([]), np.array([])
 
-        # Combine
         parts_X = [x for x in [X_meta, X_coll] if len(x) > 0]
         parts_y = [y for y in [y_meta, y_coll] if len(y) > 0]
 
@@ -384,10 +474,8 @@ def retrain_model():
         logger.info(f"Combined dataset: {len(X)} samples "
                      f"({int(np.sum(y == 1))} pos, {int(np.sum(y == 0))} neg)")
 
-        # Train
         model, cv_scores = train_model(X, y)
 
-        # Save
         models_dir = BASE_DIR / "models"
         models_dir.mkdir(exist_ok=True)
         model_path = models_dir / "kill_classifier.pkl"
@@ -410,7 +498,6 @@ def retrain_model():
         with open(model_path, "wb") as f:
             pickle.dump(model_data, f)
 
-        # Save training metadata
         meta = {k: v for k, v in model_data.items() if k != "model"}
         with open(models_dir / "training_meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
@@ -422,24 +509,102 @@ def retrain_model():
         logger.error(f"Retraining failed: {e}", exc_info=True)
 
 
-def main():
-    logger.info("=" * 60)
-    logger.info("CS2 Training Data Collector")
-    logger.info("=" * 60)
+def collect_from_api(queries, per_query):
+    """Search Medal.tv API and return list of {url, expected_kills, title}."""
+    api_key = get_api_key()
+    if not api_key:
+        logger.error("Could not get Medal.tv API key")
+        return []
 
-    videos = load_video_list()
-    if not videos:
-        return
+    logger.info(f"Medal.tv API key: {api_key[:20]}...")
 
+    processed = load_processed_videos()
+    logger.info(f"Already processed: {len(processed)} videos")
+
+    videos = []
+    for query in queries:
+        logger.info(f"Searching: '{query}' (limit={per_query})")
+        clips = search_medal(query, api_key, limit=per_query)
+
+        if not clips:
+            logger.warning(f"  No results for '{query}'")
+            continue
+
+        logger.info(f"  Found {len(clips)} clips")
+
+        for clip in clips:
+            content_id = str(clip.get("contentId", ""))
+            if not content_id or content_id in processed:
+                continue
+
+            title = clip.get("contentTitle", "")
+            duration = clip.get("videoLengthSeconds", 0)
+
+            # Skip very short or very long clips
+            if duration < 3 or duration > 120:
+                continue
+
+            expected = parse_kill_count(title, query)
+            if expected is None:
+                continue
+
+            # Build URL - prefer directClipUrl if available
+            clip_url = clip.get("directClipUrl", "")
+            if not clip_url:
+                clip_url = build_medal_url(content_id)
+
+            videos.append({
+                "url": clip_url,
+                "content_id": content_id,
+                "expected_kills": expected,
+                "title": title,
+                "duration": duration,
+            })
+
+        # Rate limiting
+        time.sleep(0.5)
+
+    logger.info(f"Total new videos to process: {len(videos)}")
+    return videos
+
+
+def collect_from_json():
+    """Load videos from training_videos.json (manual mode)."""
+    path = BASE_DIR / "training_videos.json"
+    if not path.exists():
+        return []
+
+    with open(path, "r", encoding="utf-8") as f:
+        videos = json.load(f)
+
+    valid = []
+    for v in videos:
+        if "url" not in v or "expected_kills" not in v:
+            continue
+        if v["expected_kills"] < 1:
+            continue
+        valid.append(v)
+
+    if valid:
+        logger.info(f"Loaded {len(valid)} videos from training_videos.json")
+    return valid
+
+
+def process_videos(videos):
+    """Download and process a list of videos, return (all_pos, all_neg, processed_ids)."""
     all_pos = []
     all_neg = []
-    processed = 0
+    new_processed = []
+    completed = 0
 
     for i, entry in enumerate(videos, 1):
         url = entry["url"]
         expected = entry["expected_kills"]
+        title = entry.get("title", url)
+        content_id = entry.get("content_id", "")
 
-        logger.info(f"\n[{i}/{len(videos)}] {url} (expected: {expected} kills)")
+        logger.info(f"\n[{i}/{len(videos)}] \"{title}\" (expected: {expected} kills)")
+        logger.info(f"  URL: {url}")
 
         # Download
         video_path = download_video(url)
@@ -458,7 +623,7 @@ def main():
         duration = len(audio) / RATE
         logger.info(f"  Audio: {duration:.1f}s")
 
-        # Find top-N peaks (ML first, spectral flux fallback)
+        # Find top-N peaks
         peaks = find_top_peaks_ml(audio, expected)
         if peaks:
             logger.info(f"  ML peaks: {[(f'{t:.2f}s', f'{p:.4f}') for t, p in peaks]}")
@@ -474,23 +639,82 @@ def main():
         pos, neg = extract_samples(audio, peaks, expected)
         all_pos.extend(pos)
         all_neg.extend(neg)
-        processed += 1
+        completed += 1
 
-        logger.info(f"  Done! Running total: {len(all_pos)} pos, {len(all_neg)} neg")
+        if content_id:
+            new_processed.append(content_id)
+
+        # Clean up downloaded video to save disk space
+        try:
+            video_path.unlink(missing_ok=True)
+            logger.info(f"  Cleaned up: {video_path.name}")
+        except OSError:
+            pass
+
+        logger.info(f"  Running total: {len(all_pos)} pos, {len(all_neg)} neg")
+
+    logger.info(f"\nProcessed: {completed}/{len(videos)} videos")
+    return all_pos, all_neg, new_processed
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Collect CS2 training data from Medal.tv")
+    parser.add_argument("--per-query", type=int, default=10,
+                        help="Number of videos per search query (default: 10)")
+    parser.add_argument("--queries", nargs="+", default=None,
+                        help="Custom search queries (default: cs2 1k..5k, cs2 ace)")
+    parser.add_argument("--manual", action="store_true",
+                        help="Only use training_videos.json (skip API search)")
+    parser.add_argument("--skip-retrain", action="store_true",
+                        help="Skip model retraining after collection")
+    args = parser.parse_args()
+
+    queries = args.queries or DEFAULT_QUERIES
+
+    logger.info("=" * 60)
+    logger.info("CS2 Training Data Collector")
+    logger.info("=" * 60)
+
+    # Collect video list
+    videos = []
+
+    if not args.manual:
+        api_videos = collect_from_api(queries, args.per_query)
+        videos.extend(api_videos)
+
+    # Also include manual entries if present
+    json_videos = collect_from_json()
+    videos.extend(json_videos)
+
+    if not videos:
+        logger.error("No videos to process. Check API connectivity or add URLs to training_videos.json")
+        return
+
+    logger.info(f"\nTotal videos to process: {len(videos)}")
+
+    # Process
+    all_pos, all_neg, new_processed = process_videos(videos)
 
     if not all_pos:
         logger.error("No positive samples collected")
         return
 
     logger.info(f"\n{'=' * 60}")
-    logger.info(f"Collection complete: {processed}/{len(videos)} videos processed")
     logger.info(f"Total: {len(all_pos)} positive, {len(all_neg)} negative samples")
 
-    # Save collected data
+    # Save
     save_collected_data(all_pos, all_neg)
 
-    # Retrain model
-    retrain_model()
+    # Update processed state
+    if new_processed:
+        processed = load_processed_videos()
+        processed.update(new_processed)
+        save_processed_videos(processed)
+        logger.info(f"Updated processed list: {len(processed)} total videos")
+
+    # Retrain
+    if not args.skip_retrain:
+        retrain_model()
 
     logger.info("=" * 60)
     logger.info("Done!")
