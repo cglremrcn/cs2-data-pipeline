@@ -1,14 +1,13 @@
 {
-  "trained_at": "2026-02-21T22:31:31.850088",
-  "n_samples": 2538,
-  "n_positive": 918,
-  "n_negative": 1620,
-  "cv_f1_mean": 0.9967,
-  "cv_f1_std": 0.004,
+  "trained_at": "2026-02-22T01:19:19.966246",
+  "n_samples": 7400,
+  "n_positive": 5400,
+  "n_negative": 2000,
+  "cv_f1_mean": 0.9908,
+  "cv_f1_std": 0.0014,
   "feature_dim": 35,
-  "sessions_used": [
-    "session_20260221_221809",
-    "session_20260221_222150",
-    "session_20260221_222631"
-  ]
+  "data_sources": [
+    "synthetic"
+  ],
+  "sessions_used": []
 }
