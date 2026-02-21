@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import wave
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -1053,6 +1054,99 @@ class CS2DataPipeline:
         return meta_path
 
     # =========================================================================
+    # Auto-retrain
+    # =========================================================================
+
+    def _should_retrain(self):
+        """Check if there are new sessions since last training."""
+        meta_path = self.base_dir / "models" / "training_meta.json"
+        if not meta_path.exists():
+            return True
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                training_meta = json.load(f)
+            trained_sessions = set(training_meta.get("sessions_used", []))
+        except (json.JSONDecodeError, OSError):
+            return True
+
+        # Check current metadata sessions
+        meta_dir = self.base_dir / "metadata"
+        current_sessions = set()
+        for mf in meta_dir.glob("*.json"):
+            try:
+                with open(mf, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("detections"):
+                    current_sessions.add(meta.get("session_id", mf.stem))
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        new_sessions = current_sessions - trained_sessions
+        if new_sessions:
+            logger.info(f"New sessions since last training: {len(new_sessions)}")
+            return True
+        return False
+
+    def _auto_retrain(self):
+        """Retrain the ML model in a background thread if new data is available."""
+        if not self._should_retrain():
+            logger.info("Model is up to date, skipping retrain")
+            return
+
+        def retrain_worker():
+            try:
+                logger.info("Auto-retrain started in background...")
+                from train_classifier import bootstrap_labels, extract_training_data, train_model
+                import pickle
+
+                labels = bootstrap_labels(self.base_dir)
+                if not labels:
+                    return
+
+                X, y = extract_training_data(labels, self.base_dir)
+                if len(X) == 0:
+                    return
+
+                model, cv_scores = train_model(X, y)
+
+                # Save model
+                models_dir = self.base_dir / "models"
+                models_dir.mkdir(exist_ok=True)
+                model_path = models_dir / "kill_classifier.pkl"
+
+                model_data = {
+                    "model": model,
+                    "trained_at": datetime.now().isoformat(),
+                    "n_samples": len(X),
+                    "n_positive": int(np.sum(y == 1)),
+                    "n_negative": int(np.sum(y == 0)),
+                    "cv_f1_mean": round(float(cv_scores.mean()), 4),
+                    "cv_f1_std": round(float(cv_scores.std()), 4),
+                    "feature_dim": X.shape[1],
+                    "sessions_used": [s["session_id"] for s in labels],
+                }
+
+                with open(model_path, "wb") as f:
+                    pickle.dump(model_data, f)
+
+                # Save training metadata
+                training_meta = {k: v for k, v in model_data.items() if k != "model"}
+                with open(models_dir / "training_meta.json", "w", encoding="utf-8") as f:
+                    json.dump(training_meta, f, indent=2, ensure_ascii=False)
+
+                # Reload model for next run
+                self._load_ml_model()
+                logger.info(f"Auto-retrain complete! F1={model_data['cv_f1_mean']:.4f}, "
+                            f"{model_data['n_samples']} samples")
+
+            except Exception as e:
+                logger.warning(f"Auto-retrain failed: {e}")
+
+        thread = threading.Thread(target=retrain_worker, daemon=True)
+        thread.start()
+
+    # =========================================================================
     # Orchestrator
     # =========================================================================
 
@@ -1130,6 +1224,10 @@ class CS2DataPipeline:
             if progress_callback:
                 progress_callback("done", f"Done! {result['kills_detected']} kills, "
                                           f"{result['clips_created']} frames.")
+
+            # Auto-retrain with new data
+            if result["kills_detected"] > 0:
+                self._auto_retrain()
 
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
