@@ -781,6 +781,22 @@ class CS2DataPipeline:
     # Common
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _detect_platform(url):
+        """Detect video platform from URL."""
+        url_lower = url.lower()
+        if "medal.tv" in url_lower:
+            return "medal.tv"
+        if "youtube.com" in url_lower or "youtu.be" in url_lower:
+            return "youtube"
+        if "twitch.tv" in url_lower:
+            return "twitch"
+        if "kick.com" in url_lower:
+            return "kick"
+        if "twitter.com" in url_lower or "x.com" in url_lower:
+            return "twitter"
+        return "unknown"
+
     def _apply_cooldown(self, detections, cooldown=None):
         """Filter detections that are too close together, keeping the highest confidence one."""
         if not detections:
@@ -1007,7 +1023,7 @@ class CS2DataPipeline:
             "pipeline_version": "4.0.0",
             "source": {
                 "url": url,
-                "platform": "medal.tv",
+                "platform": self._detect_platform(url),
                 "downloaded_file": str(video_path.relative_to(self.base_dir)),
                 "duration_seconds": round(duration, 2),
                 "resolution": f"{width}x{height}",
