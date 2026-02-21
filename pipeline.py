@@ -41,6 +41,14 @@ DEFAULT_CONFIG = {
     "fingerprint_ncc_threshold": 0.28,
     "fingerprint_top_n": 15,
 
+    # ML classifier
+    "ml_model_path": "models/kill_classifier.pkl",
+    "ml_window_ms": 250,
+    "ml_hop_ms": 50,
+    "ml_peak_height": 0.3,
+    "ml_peak_distance": 20,       # 20 hops = 1.0s
+    "ml_peak_prominence": 0.15,
+
     # Output
     "clips_dir": "clips",
 
@@ -57,6 +65,7 @@ class CS2DataPipeline:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self._setup_directories()
         self._setup_logging()
+        self._load_ml_model()
 
     def _setup_directories(self):
         """Create required output directories."""
@@ -79,6 +88,23 @@ class CS2DataPipeline:
             ch.setFormatter(fmt)
             logger.addHandler(fh)
             logger.addHandler(ch)
+
+    def _load_ml_model(self):
+        """Load the ML kill sound classifier if available."""
+        self.ml_classifier = None
+        model_path = self.base_dir / self.config["ml_model_path"]
+        try:
+            from audio_classifier import KillSoundClassifier
+            clf = KillSoundClassifier(str(model_path))
+            if clf.is_ready:
+                self.ml_classifier = clf
+                logger.info("ML classifier loaded — will use ML detection path")
+            else:
+                logger.info("ML model not found — will use NCC fallback")
+        except ImportError:
+            logger.info("audio_classifier module not available — using NCC fallback")
+        except Exception as e:
+            logger.warning(f"ML model load failed: {e} — using NCC fallback")
 
     # =========================================================================
     # Phase 1: Video Download
@@ -145,10 +171,10 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect personal kills using audio fingerprinting + kill feed verification.
+        Detect personal kills using ML classifier (preferred) or NCC fallback.
 
-        1. Audio: two-pass NCC fingerprinting to find kill sound candidates
-        2. Kill feed verification: reject candidates without visible dark bars
+        ML path:  sliding window → predict_proba → find_peaks → kill feed verify
+        NCC path: spectral flux → NCC fingerprint → kill feed verify → dedup
         """
         if progress_callback:
             progress_callback("detecting", "Detecting kill moments...")
@@ -168,7 +194,39 @@ class CS2DataPipeline:
 
         logger.info(f"Video: {width}x{height}, {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
 
-        # Step 1: Audio fingerprinting — find personal kill sounds
+        # --- ML path ---
+        if self.ml_classifier is not None:
+            logger.info("Using ML classifier for kill detection")
+            audio_path = self._extract_audio(video_path)
+            if audio_path:
+                try:
+                    ml_dets = self._detect_kills_ml(audio_path, fps)
+                    logger.info(f"ML detection: {len(ml_dets)} candidates")
+                except Exception as e:
+                    logger.warning(f"ML detection failed: {e}, falling back to NCC")
+                    ml_dets = []
+                finally:
+                    audio_path.unlink(missing_ok=True)
+
+                if ml_dets:
+                    # Verify with kill feed (same as NCC path)
+                    verified = self._verify_kill_feed(
+                        video_path, ml_dets, fps, width, height
+                    )
+                    logger.info(f"Kill feed verification: {len(verified)}/{len(ml_dets)} confirmed")
+
+                    # ML + find_peaks already deduplicates — no need for ROI dedup
+                    logger.info(f"Detection complete (ML): {len(verified)} kills")
+                    return verified
+            else:
+                logger.warning("Audio extraction failed, falling back to NCC")
+
+        # --- NCC fallback path ---
+        logger.info("Using NCC fingerprint fallback for kill detection")
+        return self._detect_kills_ncc(video_path, fps, width, height, total_frames, duration)
+
+    def _detect_kills_ncc(self, video_path, fps, width, height, total_frames, duration):
+        """Original NCC-based kill detection (fallback when ML model unavailable)."""
         audio_dets = []
         near_misses = []
         audio_path = self._extract_audio(video_path)
@@ -191,7 +249,6 @@ class CS2DataPipeline:
         logger.info(f"Kill feed verification: {len(verified)}/{len(audio_dets)} confirmed")
 
         # Step 2b: Promote near-misses with strong kill feed evidence.
-        # Only consider near-misses that are far from existing verified kills.
         if near_misses and verified:
             ver_times = {v["timestamp"] for v in verified}
             distant = [
@@ -202,7 +259,6 @@ class CS2DataPipeline:
                 promoted = self._verify_kill_feed(
                     video_path, distant, fps, width, height
                 )
-                # Filter promoted: must be >4s from verified AND from each other
                 all_times = set(ver_times)
                 final_promoted = []
                 for p in sorted(promoted, key=lambda x: -x["confidence"]):
@@ -214,16 +270,91 @@ class CS2DataPipeline:
                     verified.extend(final_promoted)
                     verified.sort(key=lambda x: x["timestamp"])
 
-        # Merge duplicate detections of the same kill using ROI comparison
+        # Merge duplicate detections using ROI comparison
         detections = self._deduplicate_detections(
             video_path, verified, fps, width, height
         )
 
-        logger.info(f"Detection complete: {len(detections)} kills")
+        logger.info(f"Detection complete (NCC): {len(detections)} kills")
         return detections
 
     # -------------------------------------------------------------------------
-    # Audio kill detection
+    # ML kill detection
+    # -------------------------------------------------------------------------
+
+    def _detect_kills_ml(self, audio_path, fps):
+        """
+        ML-based kill detection using sliding window + classifier + peak finding.
+
+        Flow: WAV → sliding windows → feature extraction → predict_proba
+              → probability curve → scipy.signal.find_peaks → kill timestamps
+        """
+        from scipy.signal import find_peaks
+        from audio_classifier import extract_features, extract_features_with_context
+
+        with wave.open(str(audio_path), 'rb') as wf:
+            rate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+        audio /= 32768.0
+
+        if len(audio) == 0:
+            return []
+
+        window_samples = int(self.config["ml_window_ms"] / 1000.0 * rate)
+        hop_samples = int(self.config["ml_hop_ms"] / 1000.0 * rate)
+
+        # Sliding window extraction
+        windows = []
+        timestamps = []
+        for start in range(0, len(audio) - window_samples, hop_samples):
+            windows.append(audio[start:start + window_samples])
+            timestamps.append((start + window_samples / 2) / rate)
+
+        if not windows:
+            return []
+
+        logger.info(f"ML: {len(windows)} windows ({self.config['ml_window_ms']}ms, "
+                     f"{self.config['ml_hop_ms']}ms hop)")
+
+        # Extract features with delta-MFCC context
+        features = []
+        for i in range(len(windows)):
+            feat = extract_features_with_context(windows, rate, i)
+            features.append(feat)
+
+        features = np.array(features)
+
+        # Predict probabilities
+        proba = self.ml_classifier.predict_proba(features)
+
+        # Find peaks in probability curve
+        peaks, properties = find_peaks(
+            proba,
+            height=self.config["ml_peak_height"],
+            distance=self.config["ml_peak_distance"],
+            prominence=self.config["ml_peak_prominence"],
+        )
+
+        detections = []
+        for peak_idx in peaks:
+            ts = timestamps[peak_idx]
+            prob = float(proba[peak_idx])
+            detections.append({
+                "timestamp": round(ts, 2),
+                "frame_number": int(ts * fps),
+                "confidence": round(prob, 4),
+                "ml_probability": round(prob, 4),
+                "detection_method": "ml_classifier",
+            })
+            logger.info(f"  ML peak: t={ts:.2f}s, prob={prob:.4f}")
+
+        return detections
+
+    # -------------------------------------------------------------------------
+    # Audio kill detection (NCC fallback)
     # -------------------------------------------------------------------------
 
     def _extract_audio(self, video_path):
