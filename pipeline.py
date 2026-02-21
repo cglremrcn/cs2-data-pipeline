@@ -210,30 +210,15 @@ class CS2DataPipeline:
                     audio_path.unlink(missing_ok=True)
 
                 if ml_dets:
-                    # High-confidence ML detections bypass kill feed verification
-                    high_conf = [d for d in ml_dets if d["confidence"] >= 0.9]
-                    low_conf = [d for d in ml_dets if d["confidence"] < 0.9]
+                    # All ML detections go through kill feed verification
+                    verified = self._verify_kill_feed(
+                        video_path, ml_dets, fps, width, height
+                    )
+                    logger.info(f"Kill feed verification: {len(verified)}/{len(ml_dets)} confirmed")
 
-                    if high_conf:
-                        for d in high_conf:
-                            d["detection_method"] = "ml_classifier_high"
-                        logger.info(f"ML high-confidence: {len(high_conf)} kills "
-                                    f"(bypass verification)")
-
-                    # Low-confidence detections still go through kill feed verification
-                    verified_low = []
-                    if low_conf:
-                        verified_low = self._verify_kill_feed(
-                            video_path, low_conf, fps, width, height
-                        )
-                        logger.info(f"Kill feed verification: "
-                                    f"{len(verified_low)}/{len(low_conf)} low-conf confirmed")
-
-                    all_dets = high_conf + verified_low
-                    all_dets.sort(key=lambda x: x["timestamp"])
-
-                    logger.info(f"Detection complete (ML): {len(all_dets)} kills")
-                    return all_dets
+                    # ML + find_peaks already deduplicates — no need for ROI dedup
+                    logger.info(f"Detection complete (ML): {len(verified)} kills")
+                    return verified
             else:
                 logger.warning("Audio extraction failed, falling back to NCC")
 
