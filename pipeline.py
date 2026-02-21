@@ -214,8 +214,10 @@ class CS2DataPipeline:
                     verified.extend(final_promoted)
                     verified.sort(key=lambda x: x["timestamp"])
 
-        # Merge duplicate detections of the same kill
-        detections = self._apply_cooldown(verified)
+        # Merge duplicate detections of the same kill using ROI comparison
+        detections = self._deduplicate_detections(
+            video_path, verified, fps, width, height
+        )
 
         logger.info(f"Detection complete: {len(detections)} kills")
         return detections
@@ -613,10 +615,12 @@ class CS2DataPipeline:
             if confirmed:
                 det["dark_ratio"] = round(peak_dark, 4)
                 det["dark_ratio_delta"] = round(delta_back, 4)
+                det["fwd_white_05"] = round(fwd_whites[0], 6)
                 det["detection_method"] = "audio+killfeed"
                 verified.append(det)
                 logger.info(f"  Confirmed: t={ts:.2f}s, dark={peak_dark:.3f}, "
                             f"d_back={delta_back:+.3f}, d_fwd={delta_fwd:+.3f}, "
+                            f"fw05={fwd_whites[0]:.4f}, "
                             f"method={'+'.join(methods)}")
             else:
                 logger.info(f"  Rejected: t={ts:.2f}s, dark={peak_dark:.3f}, "
@@ -645,6 +649,96 @@ class CS2DataPipeline:
             elif det["confidence"] > filtered[-1]["confidence"]:
                 filtered[-1] = det
 
+        return filtered
+
+    def _deduplicate_detections(self, video_path, detections, fps, width, height):
+        """Merge echo detections using kill feed ROI frame comparison.
+
+        Three zones based on time gap between consecutive detections:
+        - gap >= cooldown: always separate kills
+        - gap < min_gap (snippet length): always same sound event
+        - ambiguous range: compare kill feed ROI dark-pixel content to decide
+
+        For the ambiguous range, reads two ROI frames (+0.5s offset) and
+        computes the mean pixel difference within the combined dark mask
+        (kill feed overlay area).  A large diff means a new kill feed entry
+        appeared → separate kill.  A small diff means the same entry is
+        still visible → echo / duplicate.
+        """
+        if len(detections) < 2:
+            return detections
+
+        cooldown = self.config["cooldown_seconds"]
+        min_gap = self.config["fingerprint_snippet_ms"] / 1000.0
+
+        # Quick check: any pairs in the ambiguous range?
+        needs_video = any(
+            min_gap <= detections[i + 1]["timestamp"] - detections[i]["timestamp"] < cooldown
+            for i in range(len(detections) - 1)
+        )
+
+        if not needs_video:
+            return self._apply_cooldown(detections)
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            logger.warning("Cannot open video for deduplication, using simple cooldown")
+            return self._apply_cooldown(detections)
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        roi_x1 = int(width * self.config["roi_x_start_ratio"])
+        roi_x2 = int(width * self.config["roi_x_end_ratio"])
+        roi_y1 = int(height * self.config["roi_y_start_ratio"])
+        roi_y2 = int(height * self.config["roi_y_end_ratio"])
+
+        def read_roi_gray(ts):
+            fn = min(int((ts + 0.5) * fps), total_frames - 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+            ret, frame = cap.read()
+            if not ret:
+                return None
+            return cv2.cvtColor(
+                frame[roi_y1:roi_y2, roi_x1:roi_x2], cv2.COLOR_BGR2GRAY
+            )
+
+        def kill_feed_changed(roi_a, roi_b):
+            if roi_a is None or roi_b is None:
+                return False
+            # Compare only within dark regions (kill feed overlay bars).
+            dark_mask = (roi_a < 60) | (roi_b < 60)
+            if np.sum(dark_mask) < roi_a.size * 0.01:
+                return False
+            diff = np.abs(roi_a.astype(np.int16) - roi_b.astype(np.int16))
+            score = np.mean(diff[dark_mask]) / 255.0
+            return score > 0.20
+
+        filtered = [detections[0]]
+        prev_roi = read_roi_gray(detections[0]["timestamp"])
+
+        for det in detections[1:]:
+            gap = det["timestamp"] - filtered[-1]["timestamp"]
+
+            if gap >= cooldown:
+                filtered.append(det)
+                prev_roi = read_roi_gray(det["timestamp"])
+            elif gap < min_gap:
+                if det["confidence"] > filtered[-1]["confidence"]:
+                    filtered[-1] = det
+                    prev_roi = read_roi_gray(det["timestamp"])
+            else:
+                curr_roi = read_roi_gray(det["timestamp"])
+                if kill_feed_changed(prev_roi, curr_roi):
+                    logger.info(
+                        f"  Kill feed split: {filtered[-1]['timestamp']:.2f}s "
+                        f"-> {det['timestamp']:.2f}s"
+                    )
+                    filtered.append(det)
+                    prev_roi = curr_roi
+                elif det["confidence"] > filtered[-1]["confidence"]:
+                    filtered[-1] = det
+                    prev_roi = read_roi_gray(det["timestamp"])
+
+        cap.release()
         return filtered
 
     # =========================================================================
