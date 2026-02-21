@@ -40,6 +40,7 @@ roi_diagnostic.py
 # ML models and training data
 models/*.pkl
 training_data/
+training_videos.json
 
 # Logs
 *.log
