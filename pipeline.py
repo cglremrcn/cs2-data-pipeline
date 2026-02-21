@@ -45,8 +45,8 @@ DEFAULT_CONFIG = {
     "ml_model_path": "models/kill_classifier.pkl",
     "ml_window_ms": 250,
     "ml_hop_ms": 50,
-    "ml_peak_height": 0.3,
-    "ml_peak_distance": 20,       # 20 hops = 1.0s
+    "ml_peak_height": 0.25,
+    "ml_peak_distance": 10,       # 10 hops = 0.5s
     "ml_peak_prominence": 0.15,
 
     # Output
