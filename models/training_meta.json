@@ -1,0 +1,15 @@
+{
+  "trained_at": "2026-02-21T17:47:37.934676",
+  "n_samples": 423,
+  "n_positive": 153,
+  "n_negative": 270,
+  "cv_f1_mean": 0.9723,
+  "cv_f1_std": 0.0337,
+  "feature_dim": 35,
+  "sessions_used": [
+    "session_20260221_163138",
+    "session_20260221_163712",
+    "session_20260221_165202",
+    "session_20260221_165704"
+  ]
+}
