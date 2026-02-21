@@ -41,6 +41,7 @@ roi_diagnostic.py
 models/*.pkl
 training_data/
 training_videos.json
+medal_api_key.txt
 
 # Logs
 *.log
