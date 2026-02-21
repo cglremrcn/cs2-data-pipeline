@@ -1,18 +1,14 @@
 {
-  "trained_at": "2026-02-21T18:35:55.284137",
-  "n_samples": 799,
-  "n_positive": 289,
-  "n_negative": 510,
-  "cv_f1_mean": 0.9859,
-  "cv_f1_std": 0.0092,
+  "trained_at": "2026-02-21T22:31:31.850088",
+  "n_samples": 2538,
+  "n_positive": 918,
+  "n_negative": 1620,
+  "cv_f1_mean": 0.9967,
+  "cv_f1_std": 0.004,
   "feature_dim": 35,
   "sessions_used": [
-    "session_20260221_163138",
-    "session_20260221_163712",
-    "session_20260221_165202",
-    "session_20260221_165704",
-    "session_20260221_182303",
-    "session_20260221_183126",
-    "session_20260221_183508"
+    "session_20260221_221809",
+    "session_20260221_222150",
+    "session_20260221_222631"
   ]
 }
