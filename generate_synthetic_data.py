@@ -44,6 +44,21 @@ WINDOW_SAMPLES = int(WINDOW_MS / 1000.0 * RATE)
 HOP_MS = 50
 HOP_SAMPLES = int(HOP_MS / 1000.0 * RATE)
 
+# Curated kill sound files with sampling weights.
+# These are the actual headshot/kill sounds from CS2 game files (player folder).
+# noarmor variants are the most common (most kills are headshots without helmet).
+KILL_SOUND_FILES = {
+    "sounds_player_headshot_noarmor_01.wav": 0.11,
+    "sounds_player_headshot_noarmor_02.wav": 0.11,
+    "sounds_player_headshot_noarmor_03.wav": 0.11,
+    "sounds_player_headshot_noarmor_04.wav": 0.11,
+    "sounds_player_headshot_noarmor_05.wav": 0.11,
+    "sounds_player_headshot_armor_e1.wav": 0.08,        # Headshot with armor (dink)
+    "sounds_player_headshot_armor_flesh.wav": 0.11,     # Headshot armor + flesh
+    "sounds_player_bodyshot_kill_01.wav": 0.11,         # Bodyshot kill
+    "sounds_player_kill_doof_01.wav": 0.15,             # Kill confirmation sound (Reddit verified)
+}
+
 
 def _load_audio_file(path):
     """Load any audio file as mono float64 at 22050 Hz."""
@@ -67,16 +82,25 @@ def _load_audio_file(path):
 
 
 def load_reference_sounds(ref_dir):
-    """Load all WAV files from reference_sounds/ directory."""
+    """Load curated kill sound WAVs from reference_sounds/ directory.
+
+    Only loads files listed in KILL_SOUND_FILES with their sampling weights.
+    """
     ref_dir = Path(ref_dir)
     sounds = []
 
-    for wav_file in sorted(ref_dir.glob("*.wav")):
+    for filename, weight in KILL_SOUND_FILES.items():
+        wav_file = ref_dir / filename
+        if not wav_file.exists():
+            logger.warning(f"  Missing: {filename}")
+            continue
+
         audio = _load_audio_file(wav_file)
         if audio is not None and len(audio) > 0:
-            sounds.append({"name": wav_file.stem, "audio": audio})
+            sounds.append({"name": wav_file.stem, "audio": audio, "weight": weight})
             logger.info(f"  Loaded: {wav_file.name} "
-                        f"({len(audio)} samples, {len(audio)/RATE:.3f}s)")
+                        f"({len(audio)} samples, {len(audio)/RATE:.3f}s, "
+                        f"weight={weight:.0%})")
 
     return sounds
 
@@ -138,10 +162,15 @@ def generate_dataset(reference_sounds, background_audios,
 
     logger.info(f"Target: {n_positive} positive + {n_negative} negative samples")
 
+    # Build weighted sampling probabilities
+    weights = np.array([s["weight"] for s in reference_sounds])
+    weights = weights / weights.sum()
+
     # --- Positive samples ---
     for i in range(n_positive):
         bg = background_audios[np.random.randint(len(background_audios))]
-        kill = reference_sounds[np.random.randint(len(reference_sounds))]["audio"]
+        idx = np.random.choice(len(reference_sounds), p=weights)
+        kill = reference_sounds[idx]["audio"]
 
         snr = np.random.uniform(*snr_range)
 
