@@ -1,6 +1,6 @@
 # CS2 Data Pipeline
 
-Automated pipeline that detects personal kill moments from CS2 (Counter-Strike 2) gameplay clips and extracts frame sequences for each kill. Paste a Medal.tv URL and go.
+Automated pipeline that detects personal kill moments from CS2 (Counter-Strike 2) gameplay clips and extracts frame sequences for each kill. Paste any video URL (Medal.tv, YouTube, Twitch, Kick, etc.) and go.
 
 ## Features
 
@@ -9,6 +9,8 @@ Automated pipeline that detects personal kill moments from CS2 (Counter-Strike 2
 - **Kill Feed Verification** — Three-signal visual verification eliminates false positives
 - **Frame Sequence Extraction** — Saves 26 frames per kill (2s before, kill moment, 0.5s after)
 - **NCC Fallback** — Original audio fingerprinting system kicks in when no trained model exists
+- **Mass Training Data Collection** — Automated Medal.tv API search to collect hundreds of labeled training videos
+- **Confidence-Based Verification** — High-confidence ML detections bypass visual verification for speed
 - **Web Interface** — Flask-based web UI with real-time progress tracking
 - **Metadata Generation** — JSON metadata for each processing session
 
@@ -26,7 +28,7 @@ pip install -r requirements.txt
 - opencv-python — video frame processing
 - numpy — numerical operations
 - flask — web interface
-- yt-dlp — video download from Medal.tv
+- yt-dlp — video download (supports Medal.tv, YouTube, Twitch, Kick, and 1000+ sites)
 - scikit-learn — ML kill sound classifier
 - scipy — signal processing and peak finding
 
@@ -36,7 +38,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open `http://localhost:5000` in your browser. Paste a Medal.tv URL and click "Start".
+Open `http://localhost:5000` in your browser. Paste any CS2 gameplay video URL and click "Process".
 
 ### Training the Model
 
@@ -47,6 +49,17 @@ python train_classifier.py
 ```
 
 This reads kill timestamps from `metadata/*.json`, extracts audio features from the corresponding videos, and trains the classifier. The model is saved to `models/kill_classifier.pkl`.
+
+### Mass Training Data Collection
+
+Automatically search Medal.tv for CS2 kill clips and collect training data:
+
+```bash
+python collect_training_data.py                # default: 10 videos per query
+python collect_training_data.py --per-query 100 # more data
+```
+
+Searches "cs2 1k" through "cs2 5k" + "cs2 ace", uses title kill count as ground truth, and retrains the model with collected data.
 
 ## Output
 
@@ -145,11 +158,12 @@ More videos processed = better model accuracy.
 ## Project Structure
 
 ```
-├── app.py                 # Flask web server
-├── pipeline.py            # CS2DataPipeline class (ML + NCC fallback)
-├── audio_classifier.py    # Feature extraction + classifier wrapper
-├── train_classifier.py    # Model training script
-├── requirements.txt       # Python dependencies
+├── app.py                     # Flask web server
+├── pipeline.py                # CS2DataPipeline class (ML + NCC fallback)
+├── audio_classifier.py        # Feature extraction + classifier wrapper
+├── train_classifier.py        # Model training script
+├── collect_training_data.py   # Mass training data collector (Medal.tv API)
+├── requirements.txt           # Python dependencies
 ├── models/
 │   ├── kill_classifier.pkl    # Trained model (gitignored)
 │   └── training_meta.json     # Training metadata
