@@ -286,6 +286,26 @@ def main():
     # Step 2: Extract training data
     logger.info("\n[2/4] Extracting features...")
     X, y = extract_training_data(labels, BASE_DIR)
+
+    # Merge collected data from training_data/features.npz if available
+    npz_path = BASE_DIR / "training_data" / "features.npz"
+    if npz_path.exists():
+        try:
+            collected = np.load(npz_path)
+            X_coll = collected["X"]
+            y_coll = collected["y"]
+            logger.info(f"Loaded collected data: {len(X_coll)} samples "
+                         f"({int(np.sum(y_coll == 1))} pos, {int(np.sum(y_coll == 0))} neg)")
+            if len(X) > 0:
+                X = np.vstack([X, X_coll])
+                y = np.concatenate([y, y_coll])
+            else:
+                X = X_coll
+                y = y_coll
+            logger.info(f"Combined dataset: {len(X)} samples")
+        except Exception as e:
+            logger.warning(f"Could not load collected data: {e}")
+
     if len(X) == 0:
         logger.error("No training data extracted")
         return
