@@ -214,8 +214,8 @@ class CS2DataPipeline:
                     verified.extend(final_promoted)
                     verified.sort(key=lambda x: x["timestamp"])
 
-        # Use 2.0s cooldown to merge duplicate detections of the same kill
-        detections = self._apply_cooldown(verified, cooldown=2.0)
+        # Merge duplicate detections of the same kill
+        detections = self._apply_cooldown(verified)
 
         logger.info(f"Detection complete: {len(detections)} kills")
         return detections
