@@ -46,8 +46,8 @@ DEFAULT_CONFIG = {
     "ml_model_path": "models/kill_classifier.pkl",
     "ml_window_ms": 250,
     "ml_hop_ms": 50,
-    "ml_peak_height": 0.25,
-    "ml_peak_distance": 10,       # 10 hops = 0.5s
+    "ml_peak_height": 0.45,
+    "ml_peak_distance": 20,       # 20 hops = 1.0s
     "ml_peak_prominence": 0.15,
 
     # Output
@@ -172,10 +172,8 @@ class CS2DataPipeline:
 
     def detect_kills(self, video_path, progress_callback=None):
         """
-        Detect personal kills using ML classifier (preferred) or NCC fallback.
-
-        ML path:  sliding window → predict_proba → find_peaks → kill feed verify
-        NCC path: spectral flux → NCC fingerprint → kill feed verify → dedup
+        Detect personal kills using direct NCC template matching against
+        known kill sound (kill_doof_01.wav) + kill feed visual verification.
         """
         if progress_callback:
             progress_callback("detecting", "Detecting kill moments...")
@@ -195,36 +193,33 @@ class CS2DataPipeline:
 
         logger.info(f"Video: {width}x{height}, {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
 
-        # --- ML path ---
-        if self.ml_classifier is not None:
-            logger.info("Using ML classifier for kill detection")
-            audio_path = self._extract_audio(video_path)
-            if audio_path:
-                try:
-                    ml_dets = self._detect_kills_ml(audio_path, fps)
-                    logger.info(f"ML detection: {len(ml_dets)} candidates")
-                except Exception as e:
-                    logger.warning(f"ML detection failed: {e}, falling back to NCC")
-                    ml_dets = []
-                finally:
-                    audio_path.unlink(missing_ok=True)
+        # --- Direct NCC template matching ---
+        logger.info("Using direct NCC template matching for kill detection")
+        audio_path = self._extract_audio(video_path)
+        if not audio_path:
+            logger.warning("Audio extraction failed")
+            return []
 
-                if ml_dets:
-                    # All ML detections go through kill feed verification
-                    verified = self._verify_kill_feed(
-                        video_path, ml_dets, fps, width, height
-                    )
-                    logger.info(f"Kill feed verification: {len(verified)}/{len(ml_dets)} confirmed")
+        try:
+            ncc_dets = self._detect_kills_template_ncc(audio_path, fps)
+            logger.info(f"NCC template: {len(ncc_dets)} candidates")
+        except Exception as e:
+            logger.warning(f"NCC template detection failed: {e}")
+            ncc_dets = []
+        finally:
+            audio_path.unlink(missing_ok=True)
 
-                    # ML + find_peaks already deduplicates — no need for ROI dedup
-                    logger.info(f"Detection complete (ML): {len(verified)} kills")
-                    return verified
-            else:
-                logger.warning("Audio extraction failed, falling back to NCC")
+        if not ncc_dets:
+            logger.info("No kill sound matches found")
+            return []
 
-        # --- NCC fallback path ---
-        logger.info("Using NCC fingerprint fallback for kill detection")
-        return self._detect_kills_ncc(video_path, fps, width, height, total_frames, duration)
+        # Kill feed visual verification
+        verified = self._verify_kill_feed(
+            video_path, ncc_dets, fps, width, height
+        )
+        logger.info(f"Kill feed verification: {len(verified)}/{len(ncc_dets)} confirmed")
+        logger.info(f"Detection complete: {len(verified)} kills")
+        return verified
 
     def _detect_kills_ncc(self, video_path, fps, width, height, total_frames, duration):
         """Original NCC-based kill detection (fallback when ML model unavailable)."""
@@ -280,7 +275,96 @@ class CS2DataPipeline:
         return detections
 
     # -------------------------------------------------------------------------
-    # ML kill detection
+    # Direct NCC template matching against known kill sound
+    # -------------------------------------------------------------------------
+
+    def _detect_kills_template_ncc(self, audio_path, fps):
+        """
+        Match kill_doof_01.wav directly against video audio using
+        normalized cross-correlation. No ML, no training needed.
+        """
+        from scipy.signal import fftconvolve, find_peaks
+
+        with wave.open(str(audio_path), 'rb') as wf:
+            rate = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
+
+        if len(audio) == 0:
+            return []
+
+        # Load kill sound reference
+        ref_path = self.base_dir / "reference_sounds" / "sounds_player_kill_doof_01.wav"
+        if not ref_path.exists():
+            logger.warning(f"Reference sound not found: {ref_path}")
+            return []
+
+        ref_audio = self._load_reference_wav(ref_path, rate)
+        if ref_audio is None or len(ref_audio) == 0:
+            return []
+
+        logger.info(f"Reference: kill_doof_01 ({len(ref_audio)/rate:.3f}s)")
+
+        # Normalized cross-correlation via FFT
+        ref_norm = ref_audio - np.mean(ref_audio)
+        audio_norm = audio - np.mean(audio)
+
+        corr = fftconvolve(audio_norm, ref_norm[::-1], mode='valid')
+
+        # Local energy for normalization
+        ref_energy = np.sqrt(np.sum(ref_norm ** 2))
+        cumsum = np.cumsum(audio_norm ** 2)
+        window = len(ref_norm)
+        local_energy = np.sqrt(
+            cumsum[window:] - np.concatenate([[0], cumsum[:len(cumsum) - window - 1]])
+        )
+
+        min_len = min(len(corr), len(local_energy))
+        ncc = corr[:min_len] / (ref_energy * local_energy[:min_len] + 1e-10)
+
+        # Find peaks: threshold 0.3, minimum 1.5s between kills
+        ncc_threshold = self.config.get("ncc_template_threshold", 0.30)
+        min_distance = int(1.5 * rate)
+
+        peaks, properties = find_peaks(ncc, height=ncc_threshold, distance=min_distance)
+
+        detections = []
+        for peak_idx in peaks:
+            ts = peak_idx / rate
+            score = float(ncc[peak_idx])
+            detections.append({
+                "timestamp": round(ts, 2),
+                "frame_number": int(ts * fps),
+                "confidence": round(score, 4),
+                "ncc_score": round(score, 4),
+                "detection_method": "ncc_template",
+            })
+            logger.info(f"  NCC peak: t={ts:.2f}s, score={score:.4f}")
+
+        return detections
+
+    def _load_reference_wav(self, path, target_rate):
+        """Load a WAV file and resample to target rate."""
+        import subprocess as sp
+        tmp = path.parent / f"_tmp_{path.stem}_ref.wav"
+        try:
+            sp.run([
+                "ffmpeg", "-y", "-i", str(path),
+                "-ar", str(target_rate), "-ac", "1",
+                "-acodec", "pcm_s16le", str(tmp),
+            ], capture_output=True, check=True, timeout=10)
+            with wave.open(str(tmp), 'rb') as wf:
+                raw = wf.readframes(wf.getnframes())
+            return np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
+        except Exception as e:
+            logger.warning(f"Failed to load reference: {e}")
+            return None
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+
+    # -------------------------------------------------------------------------
+    # ML kill detection (legacy)
     # -------------------------------------------------------------------------
 
     def _detect_kills_ml(self, audio_path, fps):
