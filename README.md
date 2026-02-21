@@ -42,24 +42,24 @@ Open `http://localhost:5000` in your browser. Paste any CS2 gameplay video URL a
 
 ### Training the Model
 
-The model auto-trains after each processed video. To manually train or retrain:
+**Step 1: Generate synthetic training data from clean reference sounds:**
+
+```bash
+# Put CS2 kill sound WAV files in reference_sounds/
+# Put at least one CS2 gameplay video in downloads/
+python generate_synthetic_data.py
+python generate_synthetic_data.py --n-positive 1000 --n-negative 3000  # more data
+```
+
+This mixes clean kill sounds into real gameplay audio at various volumes, creating perfectly labeled training data.
+
+**Step 2: Train the classifier:**
 
 ```bash
 python train_classifier.py
 ```
 
-This reads kill timestamps from `metadata/*.json`, extracts audio features from the corresponding videos, and trains the classifier. The model is saved to `models/kill_classifier.pkl`.
-
-### Mass Training Data Collection
-
-Automatically search Medal.tv for CS2 kill clips and collect training data:
-
-```bash
-python collect_training_data.py                # default: 10 videos per query
-python collect_training_data.py --per-query 100 # more data
-```
-
-Searches "cs2 1k" through "cs2 5k" + "cs2 ace", uses title kill count as ground truth, and retrains the model with collected data.
+Training uses synthetic data (primary) and real metadata from processed sessions (secondary). The model is saved to `models/kill_classifier.pkl`.
 
 ## Output
 
@@ -117,9 +117,20 @@ A `GradientBoostingClassifier` trained on a 35-dimensional feature vector per au
 
 Peak finding with `scipy.signal.find_peaks` provides natural deduplication — no cooldown or echo suppression needed.
 
+### Synthetic Training Data
+
+Instead of noisy auto-labeled data, training uses **clean reference sounds** mixed with real gameplay audio:
+
+1. **Reference sounds** — Clean kill sound WAVs extracted from CS2 game files (`reference_sounds/`)
+2. **Background audio** — Real CS2 gameplay audio from downloaded videos
+3. **Mixing** — Kill sounds injected at random positions with varying SNR (3-20 dB)
+4. **Labels** — Perfect: we know exactly where each kill sound was placed
+
+This gives unlimited, perfectly labeled training data without manual annotation.
+
 ### Data Augmentation
 
-Training data is augmented 16x per kill sample:
+Each positive sample is augmented 8-16x:
 - Time shift (±15ms, ±30ms)
 - Volume scaling (0.7x, 0.85x, 1.15x)
 - Noise injection (SNR 10/15/20 dB)
@@ -158,22 +169,24 @@ More videos processed = better model accuracy.
 ## Project Structure
 
 ```
-├── app.py                     # Flask web server
-├── pipeline.py                # CS2DataPipeline class (ML + NCC fallback)
-├── audio_classifier.py        # Feature extraction + classifier wrapper
-├── train_classifier.py        # Model training script
-├── collect_training_data.py   # Mass training data collector (Medal.tv API)
-├── requirements.txt           # Python dependencies
+├── app.py                        # Flask web server
+├── pipeline.py                   # CS2DataPipeline class (ML + NCC fallback)
+├── audio_classifier.py           # Feature extraction + classifier wrapper
+├── train_classifier.py           # Model training script
+├── generate_synthetic_data.py    # Synthetic training data from reference sounds
+├── collect_training_data.py      # Mass training data collector (Medal.tv API)
+├── requirements.txt              # Python dependencies
+├── reference_sounds/             # Clean kill sound WAVs from game files
 ├── models/
-│   ├── kill_classifier.pkl    # Trained model (gitignored)
-│   └── training_meta.json     # Training metadata
+│   ├── kill_classifier.pkl       # Trained model (gitignored)
+│   └── training_meta.json        # Training metadata
 ├── templates/
-│   └── index.html         # Web UI
+│   └── index.html                # Web UI
 ├── static/
-│   └── style.css          # Styling
-├── downloads/             # Downloaded videos (runtime)
-├── clips/                 # Extracted kill frames (runtime)
-└── metadata/              # JSON session metadata (runtime)
+│   └── style.css                 # Styling
+├── downloads/                    # Downloaded videos (runtime)
+├── clips/                        # Extracted kill frames (runtime)
+└── metadata/                     # JSON session metadata (runtime)
 ```
 
 ## API
