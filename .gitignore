@@ -37,6 +37,10 @@ test_detection.py
 check_kills.py
 roi_diagnostic.py
 
+# ML models and training data
+models/*.pkl
+training_data/
+
 # Logs
 *.log
 
