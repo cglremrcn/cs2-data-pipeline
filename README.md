@@ -1,15 +1,16 @@
 # CS2 Data Pipeline
 
-Automated pipeline that detects personal kill moments from CS2 (Counter-Strike 2) gameplay clips and extracts frame sequences for each kill. No manual setup required — paste a Medal.tv URL and go.
+Automated pipeline that detects personal kill moments from CS2 (Counter-Strike 2) gameplay clips and extracts frame sequences for each kill. Paste a Medal.tv URL and go.
 
 ## Features
 
-- **Automatic Video Download** — Downloads videos from Medal.tv links via yt-dlp
-- **Personal Kill Detection** — Detects only the player's own kills using audio fingerprinting + three-signal kill feed verification
-- **Frame Sequence Extraction** — Saves 26 frames per kill (2s before, kill moment, 0.5s after) with no overlap between adjacent kills
-- **Near-Miss Promotion** — Audio candidates just below NCC threshold get a second chance if strong visual evidence exists
-- **Metadata Generation** — JSON metadata for each processing session
+- **ML Kill Sound Detection** — GradientBoosting classifier trained on 35-dim audio features (MFCC, spectral) replaces hand-tuned thresholds
+- **Auto-Retrain** — Model automatically retrains after each new video, improving over time
+- **Kill Feed Verification** — Three-signal visual verification eliminates false positives
+- **Frame Sequence Extraction** — Saves 26 frames per kill (2s before, kill moment, 0.5s after)
+- **NCC Fallback** — Original audio fingerprinting system kicks in when no trained model exists
 - **Web Interface** — Flask-based web UI with real-time progress tracking
+- **Metadata Generation** — JSON metadata for each processing session
 
 ## Installation
 
@@ -28,7 +29,17 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open `http://localhost:5000` in your browser. Paste a Medal.tv URL and click "Start" — processing begins immediately, no setup required.
+Open `http://localhost:5000` in your browser. Paste a Medal.tv URL and click "Start".
+
+### Training the Model
+
+The model auto-trains after each processed video. To manually train or retrain:
+
+```bash
+python train_classifier.py
+```
+
+This reads kill timestamps from `metadata/*.json`, extracts audio features from the corresponding videos, and trains the classifier. The model is saved to `models/kill_classifier.pkl`.
 
 ## Output
 
@@ -51,58 +62,97 @@ clips/session_20260214_123456/
     └── ...
 ```
 
-- Frames are sampled every 0.1 seconds (every 6th frame at 60fps)
-- Before/after windows are clamped at adjacent kill boundaries — frames from one kill never cross into another
-
 ## Technical Details
 
-### Kill Detection Algorithm
+### Detection Pipeline
 
-**Step 1: Auto-calibrating audio fingerprinting** (personal kills only)
-- Two-pass approach: spectral flux onset detection → NCC fingerprint matching
-- Pass 1: Detects all audio onset candidates in the 1800–4500 Hz band using spectral flux with a low threshold (intentional over-detection)
-- Auto-calibration: Extracts 250ms audio snippets from top candidates, computes pairwise Normalized Cross-Correlation (NCC) to discover the repeating kill sound pattern — no manual template needed
-- Pass 2: Scores all candidates against the discovered reference, keeps matches with NCC >= 0.28. Candidates with NCC between 0.168–0.28 are kept as near-misses for potential promotion
-- Time-domain NCC with +/-30ms shift tolerance via FFT cross-correlation
+```
+Video → FFmpeg → WAV (22050Hz mono)
+  → Sliding window (250ms, 50ms hop)
+    → Feature extraction (35-dim) per window
+      → GradientBoosting.predict_proba()
+        → Probability curve
+          → scipy.signal.find_peaks (natural deduplication)
+            → Kill feed verification (3-signal visual check)
+              → Final kill timestamps
+```
 
-**Step 2: Kill feed verification** (eliminates false positives)
+### ML Classifier (Primary)
 
-Three complementary signals verify each audio candidate by analyzing the kill feed ROI (top-right corner of the screen):
+A `GradientBoostingClassifier` trained on a 35-dimensional feature vector per audio window:
+
+| Index | Feature | Purpose |
+|-------|---------|---------|
+| 0-12 | 13 MFCC | Timbral character of kill sound |
+| 13-25 | 13 delta-MFCC | Onset dynamics (sudden start) |
+| 26 | Spectral centroid | Kill sound sits at 2000-3500 Hz |
+| 27 | Spectral bandwidth | Narrow band = tonal sound |
+| 28 | Spectral rolloff | Energy distribution |
+| 29 | Spectral flatness | Tonal (low) vs noise (high) |
+| 30 | Zero crossing rate | Sound character |
+| 31 | RMS energy | Volume level |
+| 32 | Band energy ratio | 1800-4500 Hz band energy / total |
+| 33 | Spectral flux | Sudden change (onset) |
+| 34 | Peak frequency | Dominant frequency |
+
+Peak finding with `scipy.signal.find_peaks` provides natural deduplication — no cooldown or echo suppression needed.
+
+### Data Augmentation
+
+Training data is augmented 16x per kill sample:
+- Time shift (±15ms, ±30ms)
+- Volume scaling (0.7x, 0.85x, 1.15x)
+- Noise injection (SNR 10/15/20 dB)
+- Pitch shift (±2% resampling)
+- Bandpass variation (wide/narrow)
+- Random jitter
+
+### Kill Feed Verification
+
+Three complementary signals verify each ML candidate by analyzing the kill feed ROI (top-right corner):
 
 | Signal | What it detects | Key conditions |
 |--------|----------------|----------------|
-| **Backward delta** | Dark_ratio increased vs 2s before (bright → dark overlay) | `peak_dark < 0.96` filters pitch-black tunnels |
-| **Forward delta** | Dark_ratio increased AFTER audio event (scene transition + kill) | `self_dark < 0.50`, `peak_dark_fwd < 0.96` |
-| **Forward text** | New bright text appeared in dark ROI within 1s after audio | `base_white < 0.001`, `delta_fwd >= 0` |
+| **Backward delta** | Dark ratio increased vs 2s before | `peak_dark < 0.96` filters pitch-black scenes |
+| **Forward delta** | Dark ratio increased after audio event | `self_dark < 0.50`, `peak_dark_fwd < 0.96` |
+| **Forward text** | New bright text appeared in dark ROI within 1s | `base_white < 0.001`, `delta_fwd >= 0` |
 
-Any single signal confirming is sufficient. Adaptive thresholds (`0.05 + baseline * 0.10`) prevent false triggers in dark environments.
+Any single signal confirming is sufficient.
 
-**Step 2b: Near-miss promotion**
-- Audio candidates just below the NCC threshold (0.168–0.28) are re-evaluated with kill feed verification
-- Must be >5s from any already-confirmed kill to avoid duplicates
-- Catches kills where the audio fingerprint was slightly distorted but the visual evidence is clear
+### NCC Fallback
 
-**Cooldown:** 2.0 seconds between final detections (allows multikills while merging duplicate detections of the same kill)
+When no trained model exists (`models/kill_classifier.pkl` not found), the system falls back to the original detection method:
+- Two-pass spectral flux + NCC audio fingerprinting
+- Auto-calibrating reference discovery via pairwise cross-correlation
+- Near-miss promotion for borderline candidates with strong visual evidence
 
-### Why This Approach Works
+### Auto-Retrain
 
-The kill confirmation sound in CS2 is always the same audio effect, so it forms a tight cluster among varied game sounds (gunshots, grenades, footsteps). Audio fingerprinting isolates the player's kills specifically — unlike visual-only methods that detect ALL players' kills in the kill feed.
+After each video is processed:
+1. Pipeline checks if new sessions exist since last training
+2. If yes, retrains the model in a background thread with all available data
+3. Reloads the updated model for the next video
 
-Kill feed verification then removes false positives using three independent visual signals. The combination of audio + visual provides high precision without requiring any manual calibration.
+More videos processed = better model accuracy.
 
 ## Project Structure
 
 ```
-├── app.py              # Flask web server
-├── pipeline.py         # CS2DataPipeline class
-├── requirements.txt    # Python dependencies
+├── app.py                 # Flask web server
+├── pipeline.py            # CS2DataPipeline class (ML + NCC fallback)
+├── audio_classifier.py    # Feature extraction + classifier wrapper
+├── train_classifier.py    # Model training script
+├── requirements.txt       # Python dependencies
+├── models/
+│   ├── kill_classifier.pkl    # Trained model (gitignored)
+│   └── training_meta.json     # Training metadata
 ├── templates/
-│   └── index.html      # Web UI
+│   └── index.html         # Web UI
 ├── static/
-│   └── style.css       # Styling
-├── downloads/          # Downloaded videos (runtime)
-├── clips/              # Extracted kill frames (runtime)
-└── metadata/           # JSON session metadata (runtime)
+│   └── style.css          # Styling
+├── downloads/             # Downloaded videos (runtime)
+├── clips/                 # Extracted kill frames (runtime)
+└── metadata/              # JSON session metadata (runtime)
 ```
 
 ## API
