@@ -271,44 +271,65 @@ def train_model(X, y):
 
 
 def main():
-    """Full training pipeline."""
+    """Full training pipeline.
+
+    Data sources (in priority order):
+    1. Synthetic data from reference sounds (training_data/synthetic_features.npz)
+    2. Real labeled data from metadata/*.json sessions
+    Either or both can be used.
+    """
     logger.info("=" * 60)
     logger.info("CS2 Kill Sound Classifier - Training")
     logger.info("=" * 60)
 
-    # Step 1: Bootstrap labels from metadata
-    logger.info("\n[1/4] Reading labels from metadata...")
-    labels = bootstrap_labels(BASE_DIR)
-    if not labels:
-        logger.error("No labeled sessions found. Run the pipeline on some videos first.")
-        return
+    X_parts = []
+    y_parts = []
+    data_sources = []
 
-    # Step 2: Extract training data
-    logger.info("\n[2/4] Extracting features...")
-    X, y = extract_training_data(labels, BASE_DIR)
-
-    # Merge collected data from training_data/features.npz if available
-    npz_path = BASE_DIR / "training_data" / "features.npz"
-    if npz_path.exists():
+    # Source 1: Synthetic data from reference sounds (preferred)
+    synth_path = BASE_DIR / "training_data" / "synthetic_features.npz"
+    if synth_path.exists():
+        logger.info("\n[1/4] Loading synthetic training data...")
         try:
-            collected = np.load(npz_path)
-            X_coll = collected["X"]
-            y_coll = collected["y"]
-            logger.info(f"Loaded collected data: {len(X_coll)} samples "
-                         f"({int(np.sum(y_coll == 1))} pos, {int(np.sum(y_coll == 0))} neg)")
-            if len(X) > 0:
-                X = np.vstack([X, X_coll])
-                y = np.concatenate([y, y_coll])
-            else:
-                X = X_coll
-                y = y_coll
-            logger.info(f"Combined dataset: {len(X)} samples")
+            synth = np.load(synth_path)
+            X_synth, y_synth = synth["X"], synth["y"]
+            X_parts.append(X_synth)
+            y_parts.append(y_synth)
+            logger.info(f"  Synthetic: {len(X_synth)} samples "
+                        f"({int(np.sum(y_synth == 1))} pos, "
+                        f"{int(np.sum(y_synth == 0))} neg)")
+            data_sources.append("synthetic")
         except Exception as e:
-            logger.warning(f"Could not load collected data: {e}")
+            logger.warning(f"  Failed to load synthetic data: {e}")
+    else:
+        logger.info("\n[1/4] No synthetic data found (training_data/synthetic_features.npz)")
+        logger.info("  Run 'python generate_synthetic_data.py' to generate it")
 
-    if len(X) == 0:
-        logger.error("No training data extracted")
+    # Source 2: Real labeled data from metadata sessions
+    logger.info("\n[2/4] Reading labels from metadata...")
+    labels = bootstrap_labels(BASE_DIR)
+    if labels:
+        logger.info("Extracting features from real sessions...")
+        X_real, y_real = extract_training_data(labels, BASE_DIR)
+        if len(X_real) > 0:
+            X_parts.append(X_real)
+            y_parts.append(y_real)
+            data_sources.append("metadata")
+    else:
+        logger.info("  No labeled metadata sessions available")
+
+    # Combine all data
+    if not X_parts:
+        logger.error("No training data from any source!")
+        logger.error("  - Run 'python generate_synthetic_data.py' for synthetic data")
+        logger.error("  - Or process videos through the pipeline for real data")
         return
+
+    X = np.vstack(X_parts)
+    y = np.concatenate(y_parts)
+    logger.info(f"\nCombined dataset: {len(X)} samples "
+                f"({int(np.sum(y == 1))} pos, {int(np.sum(y == 0))} neg)")
+    logger.info(f"Data sources: {', '.join(data_sources)}")
 
     # Step 3: Train model
     logger.info("\n[3/4] Training model...")
@@ -329,7 +350,8 @@ def main():
         "cv_f1_mean": round(float(cv_scores.mean()), 4),
         "cv_f1_std": round(float(cv_scores.std()), 4),
         "feature_dim": X.shape[1],
-        "sessions_used": [s["session_id"] for s in labels],
+        "data_sources": data_sources,
+        "sessions_used": [s["session_id"] for s in labels] if labels else [],
     }
 
     with open(model_path, "wb") as f:
@@ -346,6 +368,7 @@ def main():
     # Summary
     logger.info("\n" + "=" * 60)
     logger.info("Training complete!")
+    logger.info(f"  Sources: {', '.join(data_sources)}")
     logger.info(f"  Samples: {len(X)} ({model_data['n_positive']} pos, {model_data['n_negative']} neg)")
     logger.info(f"  CV F1: {model_data['cv_f1_mean']:.4f} (+/- {model_data['cv_f1_std']:.4f})")
     logger.info(f"  Model: {model_path}")
