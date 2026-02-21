@@ -133,8 +133,17 @@
             if (!currentSessionId) return;
 
             fetch(`/api/status/${currentSessionId}`)
-            .then(r => r.json())
+            .then(r => {
+                if (r.status === 404) {
+                    clearInterval(pollInterval);
+                    showError('Session lost (server restarted). Please try again.');
+                    loadHistory();
+                    return null;
+                }
+                return r.json();
+            })
             .then(data => {
+                if (!data) return;
                 updateStatus(data.status);
 
                 if (data.done) {
