@@ -43,6 +43,9 @@ training_data/
 training_videos.json
 medal_api_key.txt
 
+# Reference sounds (extracted from game files)
+reference_sounds/*.wav
+
 # Logs
 *.log
 
