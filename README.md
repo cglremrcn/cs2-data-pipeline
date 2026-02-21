@@ -18,10 +18,17 @@ Automated pipeline that detects personal kill moments from CS2 (Counter-Strike 2
 pip install -r requirements.txt
 ```
 
-**Requirements:**
+**System Requirements:**
 - Python 3.10+
 - FFmpeg (must be in PATH)
-- yt-dlp
+
+**Python Dependencies:**
+- opencv-python — video frame processing
+- numpy — numerical operations
+- flask — web interface
+- yt-dlp — video download from Medal.tv
+- scikit-learn — ML kill sound classifier
+- scipy — signal processing and peak finding
 
 ## Usage
 
