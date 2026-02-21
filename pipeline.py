@@ -211,8 +211,8 @@ class CS2DataPipeline:
 
                 if ml_dets:
                     # High-confidence ML detections bypass kill feed verification
-                    high_conf = [d for d in ml_dets if d["confidence"] >= 0.7]
-                    low_conf = [d for d in ml_dets if d["confidence"] < 0.7]
+                    high_conf = [d for d in ml_dets if d["confidence"] >= 0.9]
+                    low_conf = [d for d in ml_dets if d["confidence"] < 0.9]
 
                     if high_conf:
                         for d in high_conf:
