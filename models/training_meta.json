@@ -1,10 +1,10 @@
 {
-  "trained_at": "2026-02-22T01:19:19.966246",
+  "trained_at": "2026-02-22T01:59:52.049791",
   "n_samples": 7400,
   "n_positive": 5400,
   "n_negative": 2000,
-  "cv_f1_mean": 0.9908,
-  "cv_f1_std": 0.0014,
+  "cv_f1_mean": 0.9852,
+  "cv_f1_std": 0.0024,
   "feature_dim": 35,
   "data_sources": [
     "synthetic"

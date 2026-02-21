@@ -48,15 +48,8 @@ HOP_SAMPLES = int(HOP_MS / 1000.0 * RATE)
 # These are the actual headshot/kill sounds from CS2 game files (player folder).
 # noarmor variants are the most common (most kills are headshots without helmet).
 KILL_SOUND_FILES = {
-    "sounds_player_headshot_noarmor_01.wav": 0.11,
-    "sounds_player_headshot_noarmor_02.wav": 0.11,
-    "sounds_player_headshot_noarmor_03.wav": 0.11,
-    "sounds_player_headshot_noarmor_04.wav": 0.11,
-    "sounds_player_headshot_noarmor_05.wav": 0.11,
-    "sounds_player_headshot_armor_e1.wav": 0.08,        # Headshot with armor (dink)
-    "sounds_player_headshot_armor_flesh.wav": 0.11,     # Headshot armor + flesh
-    "sounds_player_bodyshot_kill_01.wav": 0.11,         # Bodyshot kill
-    "sounds_player_kill_doof_01.wav": 0.15,             # Kill confirmation sound (Reddit verified)
+    "sounds_player_kill_doof_01.wav": 0.65,             # Kill confirmation sound (Reddit verified)
+    "sounds_player_bodyshot_kill_01.wav": 0.35,         # Bodyshot kill sound
 }
 
 
