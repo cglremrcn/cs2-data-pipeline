@@ -1,0 +1,43 @@
+{
+  "params": {
+    "sample_fps": 4,
+    "conf": 0.45,
+    "sim_threshold": 0.55,
+    "cooldown": 2.0,
+    "audio_window": 3.0,
+    "ncc_threshold": 0.3,
+    "width_ratio_threshold": 0.1,
+    "gap_threshold": 10
+  },
+  "mode": "audio_filter",
+  "accuracy": 0.3117,
+  "total_videos": 77,
+  "correct": 24,
+  "method_stats": {
+    "audio_filtered": {
+      "total": 68,
+      "correct": 24
+    },
+    "ncc_only": {
+      "total": 2,
+      "correct": 0
+    },
+    "4": {
+      "total": 1,
+      "correct": 0
+    },
+    "none": {
+      "total": 4,
+      "correct": 0
+    },
+    "10": {
+      "total": 1,
+      "correct": 0
+    },
+    "21": {
+      "total": 1,
+      "correct": 0
+    }
+  },
+  "tuned_at": "2026-02-22T18:34:20.674763"
+}
