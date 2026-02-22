@@ -115,8 +115,8 @@ class CS2DataPipeline:
         """Load tuned YOLO detection parameters from JSON if available."""
         params_path = self.base_dir / "models" / "yolo_params.json"
         defaults = {
-            "sample_fps": 4, "conf": 0.45, "sim_threshold": 0.55,
-            "cooldown": 2.0, "audio_window": 2.0,
+            "sample_fps": 8, "conf": 0.35, "sim_threshold": 0.35,
+            "cooldown": 0.8, "audio_window": 1.5, "ncc_threshold": 0.2,
             "width_ratio_threshold": 0.15, "gap_threshold": 15,
         }
         if params_path.exists():
@@ -307,13 +307,19 @@ class CS2DataPipeline:
         cooldown = p.get("cooldown", 2.0)
         audio_window = p.get("audio_window", 2.0)
 
-        if expected_kills is not None and expected_kills > 0 and all_transitions:
+        if expected_kills is not None and expected_kills > 0:
             # TITLE HINT MODE: We know N kills → select best N from transitions
             n = expected_kills
-            if len(all_transitions) <= n:
-                kill_times = all_transitions
-            else:
-                # Score transitions: prefer those near NCC audio peaks
+            method = "yolo_title_hint"
+
+            if not all_transitions and ncc_times:
+                # No YOLO at all — fallback to NCC peaks
+                kill_times = sorted(ncc_times)[:n]
+                method = "ncc_fallback"
+            elif not all_transitions:
+                kill_times = []
+            elif len(all_transitions) >= n:
+                # Enough YOLO transitions — score by audio and pick best N
                 scored = []
                 for ts in all_transitions:
                     audio_score = 0.0
@@ -322,18 +328,27 @@ class CS2DataPipeline:
                         audio_score = max(0, 1.0 - min_dist / audio_window)
                     scored.append((ts, audio_score))
 
-                # Sort by audio score (best first), pick top N
                 scored.sort(key=lambda x: -x[1])
                 kill_times = sorted([ts for ts, _ in scored[:n]])
+            else:
+                # YOLO under-detected — supplement with NCC peaks
+                kill_times = list(all_transitions)
+                remaining = n - len(kill_times)
+                if ncc_times and remaining > 0:
+                    unmatched = [nt for nt in ncc_times
+                                 if not any(abs(nt - yt) <= audio_window
+                                            for yt in all_transitions)]
+                    kill_times = sorted(kill_times + unmatched[:remaining])
+                    method = "yolo_ncc_supplemented"
 
             result = [{
                 "timestamp": ts,
                 "frame_number": int(ts * fps),
-                "confidence": 0.9,
-                "detection_method": "yolo_title_hint",
+                "confidence": 0.9 if method == "yolo_title_hint" else 0.7,
+                "detection_method": method,
             } for ts in kill_times]
-            logger.info(f"Title hint: selected {len(result)}/{len(all_transitions)} "
-                        f"transitions (expected {n})")
+            logger.info(f"Title hint ({method}): {len(result)}/{len(all_transitions)} "
+                        f"transitions, {len(ncc_times)} audio peaks (expected {n})")
 
         elif ncc_times and all_transitions:
             # AUDIO-FILTERED MODE: intersect transitions with NCC peaks
