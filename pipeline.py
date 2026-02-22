@@ -473,7 +473,8 @@ class CS2DataPipeline:
         logger.info(f"  YOLO transitions: {len(transitions)}")
 
         # Split by box width: gap-based and mean-based
-        widths = sorted(set(t["bw"] for t in transitions))
+        all_widths = [t["bw"] for t in transitions]
+        widths = sorted(set(all_widths))
         max_gap = 0
         gap_idx = 0
         for i in range(len(widths) - 1):
@@ -494,25 +495,35 @@ class CS2DataPipeline:
                     d.append(t)
             return d
 
-        # Gap-based split
-        if max_gap >= 15:
-            gap_thresh = (widths[gap_idx] + widths[gap_idx + 1]) / 2
-        else:
-            gap_thresh = np.mean([t["bw"] for t in transitions])
-        gap_times = _dedup([t for t in transitions if t["bw"] >= gap_thresh])
+        # Check if widths are homogeneous (all same player's kills)
+        width_range = max(all_widths) - min(all_widths)
+        width_mean = np.mean(all_widths)
+        width_ratio = width_range / width_mean if width_mean > 0 else 0
 
-        # Mean-based split
-        mean_thresh = np.mean([t["bw"] for t in transitions])
-        mean_times = _dedup([t for t in transitions if t["bw"] >= mean_thresh])
-
-        # Take the more selective (lower count) result
-        if len(gap_times) <= len(mean_times):
-            kill_times = gap_times
-            logger.info(f"  Width split: gap-based ({max_gap}px gap), "
-                        f"threshold={gap_thresh:.0f}")
+        if width_ratio < 0.15 and max_gap < 15:
+            # All transitions have similar width — likely all same player
+            kill_times = _dedup(transitions)
+            logger.info(f"  Width homogeneous (range={width_range}px, "
+                        f"ratio={width_ratio:.3f}), using all transitions")
         else:
-            kill_times = mean_times
-            logger.info(f"  Width split: mean-based, threshold={mean_thresh:.0f}")
+            # Gap-based split
+            if max_gap >= 15:
+                gap_thresh = (widths[gap_idx] + widths[gap_idx + 1]) / 2
+            else:
+                gap_thresh = width_mean
+            gap_times = _dedup([t for t in transitions if t["bw"] >= gap_thresh])
+
+            # Mean-based split
+            mean_times = _dedup([t for t in transitions if t["bw"] >= width_mean])
+
+            # Take the more selective (lower count) result
+            if len(gap_times) <= len(mean_times):
+                kill_times = gap_times
+                logger.info(f"  Width split: gap-based ({max_gap}px gap), "
+                            f"threshold={gap_thresh:.0f}")
+            else:
+                kill_times = mean_times
+                logger.info(f"  Width split: mean-based, threshold={width_mean:.0f}")
 
         logger.info(f"  YOLO kills: {len(kill_times)} at "
                     f"{[f'{t:.1f}' for t in kill_times]}")
