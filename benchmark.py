@@ -9,6 +9,8 @@ Usage:
     python benchmark.py --per-query 20     # 20 videos per query
     python benchmark.py --tune             # Grid search on already-downloaded videos
     python benchmark.py --skip-download    # Benchmark only (no new downloads)
+    python benchmark.py --color --tune     # Color-based detection grid search
+    python benchmark.py --color            # Benchmark with color detection
 """
 
 import json
@@ -44,6 +46,14 @@ DEFAULT_PARAMS = {
     "width_ratio_threshold": 0.15,
     "gap_threshold": 15,
     "cooldown": 2.0,
+}
+
+# Color-based detection parameters
+DEFAULT_COLOR_PARAMS = {
+    "sim_threshold": 0.55,
+    "cooldown": 2.0,
+    "red_highlight_threshold": 0.08,
+    "team_color_min_votes": 2,
 }
 
 
@@ -159,16 +169,93 @@ def _compare_signatures(a, b):
     return float(np.dot(fa, fb) / (na * nb))
 
 
-def detect_kills_yolo(model, video_path, params=None):
+def extract_color_features(frame, x1, y1, x2, y2):
     """
-    Run YOLO kill feed detection with given parameters.
-    Returns (kill_count, kill_times, transitions_count, width_info).
-    """
-    p = {**DEFAULT_PARAMS, **(params or {})}
+    Extract color features from a kill feed entry bounding box.
 
+    Returns dict with:
+      - red_ratio: ratio of red-hued background pixels (kill highlight)
+      - killer_hue: median hue of text pixels in left 25% (killer name)
+      - killer_team: 'T', 'CT', or 'unknown'
+      - victim_hue: median hue of text pixels in right 25% (victim name)
+      - victim_team: 'T', 'CT', or 'unknown'
+    """
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return {"red_ratio": 0.0, "killer_hue": -1, "killer_team": "unknown",
+                "victim_hue": -1, "victim_team": "unknown"}
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    # --- Red highlight detection ---
+    # Background pixels: moderate brightness (not too dark, not too bright)
+    bg_mask = (v > 15) & (v < 100)
+    bg_count = np.count_nonzero(bg_mask)
+    if bg_count > 0:
+        # Red hue in OpenCV: H<15 or H>165 (wraps around 0/180), with some saturation
+        red_mask = bg_mask & (s > 30) & ((h < 15) | (h > 165))
+        red_ratio = float(np.count_nonzero(red_mask)) / bg_count
+    else:
+        red_ratio = 0.0
+
+    # --- Killer hue (left 25% of crop) ---
+    w = crop.shape[1]
+    left_w = max(1, int(w * 0.25))
+    killer_hue, killer_team = _extract_text_hue(hsv[:, :left_w, :])
+
+    # --- Victim hue (right 25% of crop) ---
+    right_start = max(0, w - left_w)
+    victim_hue, victim_team = _extract_text_hue(hsv[:, right_start:, :])
+
+    return {
+        "red_ratio": round(red_ratio, 4),
+        "killer_hue": killer_hue,
+        "killer_team": killer_team,
+        "victim_hue": victim_hue,
+        "victim_team": victim_team,
+    }
+
+
+def _extract_text_hue(hsv_region):
+    """
+    Extract median hue from text pixels in an HSV region.
+    Text pixels: bright (V>120) and saturated (S>60).
+    Returns (median_hue, team_classification).
+    """
+    if hsv_region.size == 0:
+        return -1, "unknown"
+
+    h, s, v = hsv_region[:, :, 0], hsv_region[:, :, 1], hsv_region[:, :, 2]
+    text_mask = (v > 120) & (s > 60)
+    text_hues = h[text_mask]
+
+    if len(text_hues) < 3:
+        return -1, "unknown"
+
+    med_hue = float(np.median(text_hues))
+    team = _classify_team(med_hue)
+    return round(med_hue, 1), team
+
+
+def _classify_team(hue):
+    """Classify team from hue: T=orange(5-25), CT=blue(90-120)."""
+    if 5 <= hue <= 25:
+        return "T"
+    if 90 <= hue <= 120:
+        return "CT"
+    return "unknown"
+
+
+def scan_video_yolo(model, video_path):
+    """
+    Run YOLO inference on video ONCE. Cache all frame detections with
+    timestamps, widths, and pairwise similarities.
+    Returns list of raw detections: [{"ts": float, "bw": int, "sim": float}]
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return 0, [], 0, {}
+        return []
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -176,16 +263,17 @@ def detect_kills_yolo(model, video_path, params=None):
 
     if fps <= 0 or w <= 0 or h <= 0:
         cap.release()
-        return 0, [], 0, {}
+        return []
 
     min_x = int(w * 0.55)
     max_y = int(h * 0.22)
     min_y = int(h * 0.02)
 
-    interval = max(1, int(fps / p["sample_fps"]))
+    sample_fps = 4
+    interval = max(1, int(fps / sample_fps))
     frame_idx = 0
     prev_sig = None
-    transitions = []
+    raw_detections = []
 
     while True:
         ret, frame = cap.read()
@@ -193,7 +281,7 @@ def detect_kills_yolo(model, video_path, params=None):
             break
         if frame_idx % interval == 0:
             ts = frame_idx / fps
-            results = model(frame, conf=p["conf"], verbose=False)
+            results = model(frame, conf=0.45, verbose=False)
             best = None
             for r in results:
                 if r.boxes is None:
@@ -221,15 +309,112 @@ def detect_kills_yolo(model, video_path, params=None):
                     )
                     sim = (_compare_signatures(sig, prev_sig)
                            if prev_sig is not None else 0.0)
-                    if prev_sig is None or sim < p["sim_threshold"]:
-                        transitions.append({"ts": round(ts, 2), "bw": bw})
+                    raw_detections.append({
+                        "ts": round(ts, 2),
+                        "bw": bw,
+                        "sim": round(sim, 4),
+                    })
                     prev_sig = sig
 
         frame_idx += 1
     cap.release()
+    return raw_detections
+
+
+def scan_video_yolo_color(model, video_path):
+    """
+    Run YOLO inference on video with color feature extraction.
+    Returns list of raw detections with color data:
+    [{"ts", "bw", "sim", "red_ratio", "killer_hue", "killer_team", "victim_hue", "victim_team"}]
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if fps <= 0 or w <= 0 or h <= 0:
+        cap.release()
+        return []
+
+    min_x = int(w * 0.55)
+    max_y = int(h * 0.22)
+    min_y = int(h * 0.02)
+
+    sample_fps = 4
+    interval = max(1, int(fps / sample_fps))
+    frame_idx = 0
+    prev_sig = None
+    raw_detections = []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % interval == 0:
+            ts = frame_idx / fps
+            results = model(frame, conf=0.45, verbose=False)
+            best = None
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].cpu().numpy()]
+                    if x1 < min_x or y1 > max_y or y1 < min_y:
+                        continue
+                    bw = x2 - x1
+                    bh = y2 - y1
+                    if bw < 50 or bh < 10 or bh > 80:
+                        continue
+                    if bw / bh < 2.0 or bw / bh > 15:
+                        continue
+                    if best is None or y1 < best[1]:
+                        best = (x1, y1, x2, y2, bw, bh)
+
+            if best is not None:
+                x1, y1, x2, y2, bw, bh = best
+                crop_w = min(int(bw * 0.40), int(w * 0.18))
+                crop = frame[y1:y2, x1:min(x1 + crop_w, w)]
+                if crop.size > 0:
+                    sig = cv2.cvtColor(
+                        cv2.resize(crop, (120, 24)), cv2.COLOR_BGR2GRAY
+                    )
+                    sim = (_compare_signatures(sig, prev_sig)
+                           if prev_sig is not None else 0.0)
+
+                    # Extract color features from full bounding box
+                    color = extract_color_features(frame, x1, y1, x2, y2)
+
+                    raw_detections.append({
+                        "ts": round(ts, 2),
+                        "bw": bw,
+                        "sim": round(sim, 4),
+                        **color,
+                    })
+                    prev_sig = sig
+
+        frame_idx += 1
+    cap.release()
+    return raw_detections
+
+
+def apply_params(raw_detections, params=None):
+    """
+    Apply parameter-based filtering to cached raw detections.
+    Fast — no video I/O needed.
+    Returns (kill_count, kill_times, transitions_count, width_info).
+    """
+    p = {**DEFAULT_PARAMS, **(params or {})}
+
+    # Filter by similarity threshold to get transitions
+    transitions = []
+    for i, det in enumerate(raw_detections):
+        if i == 0 or det["sim"] < p["sim_threshold"]:
+            transitions.append(det)
 
     if len(transitions) < 3:
-        # Too few transitions — return all as kills
         times = [t["ts"] for t in transitions]
         return len(times), times, len(transitions), {"method": "too_few"}
 
@@ -269,21 +454,17 @@ def detect_kills_yolo(model, video_path, params=None):
     }
 
     if width_ratio < p["width_ratio_threshold"] and max_gap < p["gap_threshold"]:
-        # Homogeneous widths — all same player
         kill_times = _dedup(transitions)
         width_info["method"] = "homogeneous"
     else:
-        # Gap-based split
         if max_gap >= p["gap_threshold"]:
             gap_thresh = (widths[gap_idx] + widths[gap_idx + 1]) / 2
         else:
             gap_thresh = width_mean
         gap_times = _dedup([t for t in transitions if t["bw"] >= gap_thresh])
 
-        # Mean-based split
         mean_times = _dedup([t for t in transitions if t["bw"] >= width_mean])
 
-        # Take more selective
         if len(gap_times) <= len(mean_times):
             kill_times = gap_times
             width_info["method"] = "gap"
@@ -294,6 +475,127 @@ def detect_kills_yolo(model, video_path, params=None):
             width_info["threshold"] = round(width_mean, 1)
 
     return len(kill_times), kill_times, len(transitions), width_info
+
+
+def apply_color_params(raw_detections, params=None):
+    """
+    Apply color-based filtering to cached raw detections.
+    Priority: red highlight → team color voting → width fallback.
+    Returns (kill_count, kill_times, method_used, debug_info).
+    """
+    p = {**DEFAULT_COLOR_PARAMS, **(params or {})}
+
+    sim_thresh = p.get("sim_threshold", 0.55)
+    cooldown = p.get("cooldown", 2.0)
+    red_thresh = p.get("red_highlight_threshold", 0.08)
+    team_min_votes = p.get("team_color_min_votes", 2)
+
+    # Filter by similarity threshold to get transitions
+    transitions = []
+    for i, det in enumerate(raw_detections):
+        if i == 0 or det["sim"] < sim_thresh:
+            transitions.append(det)
+
+    if not transitions:
+        return 0, [], "none", {}
+
+    def _dedup(entries):
+        if not entries:
+            return []
+        times = sorted(e["ts"] for e in entries)
+        d = [times[0]]
+        for t in times[1:]:
+            if t - d[-1] >= cooldown:
+                d.append(t)
+        return d
+
+    # --- Priority 1: Red highlight ---
+    red_transitions = [t for t in transitions if t.get("red_ratio", 0) >= red_thresh]
+    if red_transitions:
+        kill_times = _dedup(red_transitions)
+        return len(kill_times), kill_times, "red_highlight", {
+            "red_count": len(red_transitions),
+            "total_transitions": len(transitions),
+            "threshold": red_thresh,
+        }
+
+    # --- Priority 2: Team color voting ---
+    team_votes = {"T": 0, "CT": 0, "unknown": 0}
+    for t in transitions:
+        kt = t.get("killer_team", "unknown")
+        team_votes[kt] = team_votes.get(kt, 0) + 1
+
+    # Determine player's team: the team that appears most as killer
+    t_count = team_votes.get("T", 0)
+    ct_count = team_votes.get("CT", 0)
+
+    if t_count >= team_min_votes or ct_count >= team_min_votes:
+        if t_count > ct_count:
+            player_team = "T"
+        elif ct_count > t_count:
+            player_team = "CT"
+        else:
+            player_team = None
+
+        if player_team:
+            team_transitions = [t for t in transitions
+                                if t.get("killer_team") == player_team]
+            if team_transitions:
+                kill_times = _dedup(team_transitions)
+                return len(kill_times), kill_times, "team_color", {
+                    "player_team": player_team,
+                    "team_votes": team_votes,
+                    "team_count": len(team_transitions),
+                    "total_transitions": len(transitions),
+                }
+
+    # --- Priority 3: Width fallback (existing logic) ---
+    if len(transitions) < 3:
+        times = [t["ts"] for t in transitions]
+        return len(times), times, "too_few", {}
+
+    all_widths = [t["bw"] for t in transitions]
+    widths = sorted(set(all_widths))
+    max_gap = 0
+    gap_idx = 0
+    for i in range(len(widths) - 1):
+        gap = widths[i + 1] - widths[i]
+        if gap > max_gap:
+            max_gap = gap
+            gap_idx = i
+
+    width_range = max(all_widths) - min(all_widths)
+    width_mean = np.mean(all_widths)
+    width_ratio = width_range / width_mean if width_mean > 0 else 0
+    wrt = p.get("width_ratio_threshold", 0.15)
+    gt = p.get("gap_threshold", 15)
+
+    if width_ratio < wrt and max_gap < gt:
+        kill_times = _dedup(transitions)
+        method = "width_homogeneous"
+    else:
+        if max_gap >= gt:
+            gap_thresh = (widths[gap_idx] + widths[gap_idx + 1]) / 2
+        else:
+            gap_thresh = width_mean
+        gap_times = _dedup([t for t in transitions if t["bw"] >= gap_thresh])
+        mean_times = _dedup([t for t in transitions if t["bw"] >= width_mean])
+        if len(gap_times) <= len(mean_times):
+            kill_times = gap_times
+        else:
+            kill_times = mean_times
+        method = "width_split"
+
+    return len(kill_times), kill_times, method, {
+        "total_transitions": len(transitions),
+        "team_votes": team_votes,
+    }
+
+
+def detect_kills_yolo(model, video_path, params=None):
+    """Convenience wrapper: scan + apply params."""
+    raw = scan_video_yolo(model, video_path)
+    return apply_params(raw, params)
 
 
 # -------------------------------------------------------------------------
@@ -314,9 +616,28 @@ def save_ground_truth(entries):
         json.dump(entries, f, indent=2, ensure_ascii=False)
 
 
-def run_benchmark(model, ground_truth, params=None):
-    """Run detection on all ground truth videos. Returns results dict."""
-    p = params or DEFAULT_PARAMS
+def scan_all_videos(model, ground_truth, use_color=True):
+    """Pre-scan all videos with YOLO. Returns dict of video_name -> raw_detections."""
+    cache = {}
+    valid = []
+    scan_fn = scan_video_yolo_color if use_color else scan_video_yolo
+    label = "color" if use_color else "basic"
+    for entry in ground_truth:
+        video_path = entry.get("video_path", "")
+        if not video_path or not Path(video_path).exists():
+            continue
+        name = Path(video_path).name
+        if name not in cache:
+            logger.info(f"  Scanning ({label}) {name}...")
+            cache[name] = scan_fn(model, video_path)
+        valid.append(entry)
+    logger.info(f"Scanned {len(cache)} videos, {sum(len(v) for v in cache.values())} raw detections")
+    return cache, valid
+
+
+def run_benchmark_cached(cache, ground_truth, params=None, verbose=True, use_color=False):
+    """Run detection using cached scans. Fast — no video I/O."""
+    p = params or (DEFAULT_COLOR_PARAMS if use_color else DEFAULT_PARAMS)
     correct = 0
     total = 0
     details = []
@@ -324,15 +645,20 @@ def run_benchmark(model, ground_truth, params=None):
 
     for entry in ground_truth:
         video_path = entry.get("video_path", "")
-        if not video_path or not Path(video_path).exists():
+        if not video_path:
+            continue
+        name = Path(video_path).name
+        if name not in cache:
             continue
 
         expected = entry["expected_kills"]
         query = entry.get("query", f"cs2 {expected}k")
 
-        detected, times, n_trans, w_info = detect_kills_yolo(
-            model, video_path, params=p
-        )
+        if use_color:
+            detected, times, method, info = apply_color_params(cache[name], params=p)
+        else:
+            detected, times, n_trans, info = apply_params(cache[name], params=p)
+            method = info.get("method", "")
 
         is_correct = detected == expected
         if is_correct:
@@ -340,26 +666,24 @@ def run_benchmark(model, ground_truth, params=None):
         total += 1
 
         detail = {
-            "video": Path(video_path).name,
+            "video": name,
             "expected": expected,
             "detected": detected,
             "correct": is_correct,
-            "transitions": n_trans,
-            "width_method": w_info.get("method", ""),
+            "method": method,
             "times": [round(t, 1) for t in times],
         }
         details.append(detail)
 
-        # By query stats
         if query not in by_query:
             by_query[query] = {"total": 0, "correct": 0}
         by_query[query]["total"] += 1
         if is_correct:
             by_query[query]["correct"] += 1
 
-        status = "OK" if is_correct else f"WRONG({detected})"
-        logger.info(f"  {Path(video_path).name}: {detected}/{expected} {status} "
-                     f"[{w_info.get('method', '')}]")
+        if verbose:
+            status = "OK" if is_correct else f"WRONG({detected})"
+            logger.info(f"  {name}: {detected}/{expected} {status} [{method}]")
 
     accuracy = correct / total if total > 0 else 0
     return {
@@ -373,24 +697,34 @@ def run_benchmark(model, ground_truth, params=None):
     }
 
 
-def run_grid_search(model, ground_truth):
-    """Grid search over key parameters."""
-    param_grid = {
-        "sim_threshold": [0.50, 0.55, 0.60, 0.65, 0.70],
-        "width_ratio_threshold": [0.10, 0.15, 0.20, 0.25],
-        "cooldown": [1.5, 2.0, 2.5, 3.0],
-        "gap_threshold": [10, 15, 20, 25],
-    }
+def run_grid_search(cache, ground_truth, use_color=False):
+    """Grid search over key parameters using cached video scans."""
+    if use_color:
+        param_grid = {
+            "sim_threshold": [0.45, 0.55, 0.65, 0.75],
+            "cooldown": [1.5, 2.0, 2.5, 3.0],
+            "red_highlight_threshold": [0.03, 0.05, 0.08, 0.12, 0.15],
+            "team_color_min_votes": [1, 2, 3],
+            # Width fallback params
+            "width_ratio_threshold": [0.10, 0.15, 0.25],
+            "gap_threshold": [10, 15, 25],
+        }
+    else:
+        param_grid = {
+            "sim_threshold": [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75],
+            "width_ratio_threshold": [0.08, 0.10, 0.15, 0.20, 0.25, 0.30],
+            "cooldown": [1.0, 1.5, 2.0, 2.5, 3.0],
+            "gap_threshold": [8, 10, 15, 20, 25, 30],
+        }
 
-    # Fixed params
     fixed = {"sample_fps": 4, "conf": 0.45}
 
     keys = list(param_grid.keys())
     values = list(param_grid.values())
     combos = list(itertools.product(*values))
 
-    logger.info(f"Grid search: {len(combos)} parameter combinations")
-    logger.info(f"Videos: {len(ground_truth)}")
+    logger.info(f"Grid search ({'color' if use_color else 'width'}): "
+                f"{len(combos)} parameter combinations")
 
     best_accuracy = -1
     best_params = None
@@ -402,7 +736,9 @@ def run_grid_search(model, ground_truth):
         for k, v in zip(keys, combo):
             params[k] = v
 
-        result = run_benchmark(model, ground_truth, params=params)
+        result = run_benchmark_cached(
+            cache, ground_truth, params=params, verbose=False, use_color=use_color
+        )
         acc = result["accuracy"]
         all_results.append({"params": params, "accuracy": acc, "correct": result["correct"]})
 
@@ -411,17 +747,16 @@ def run_grid_search(model, ground_truth):
             best_params = params.copy()
             best_result = result
 
-        if i % 20 == 0 or i == len(combos):
+        if i % 200 == 0 or i == len(combos):
             logger.info(f"  [{i}/{len(combos)}] Current best: {best_accuracy:.1%} "
                         f"({best_result['correct']}/{best_result['total_videos']})")
 
     logger.info(f"\nBest accuracy: {best_accuracy:.1%}")
     logger.info(f"Best params: {best_params}")
 
-    # Also show top 5
     all_results.sort(key=lambda x: -x["accuracy"])
-    logger.info("\nTop 5 parameter sets:")
-    for r in all_results[:5]:
+    logger.info("\nTop 10 parameter sets:")
+    for r in all_results[:10]:
         logger.info(f"  {r['accuracy']:.1%} ({r['correct']}) - {r['params']}")
 
     return best_params, best_result, all_results
@@ -441,6 +776,8 @@ def main():
                         help="Skip download, use existing videos")
     parser.add_argument("--tune", action="store_true",
                         help="Run parameter grid search")
+    parser.add_argument("--color", action="store_true",
+                        help="Use color-based detection (red highlight + team color)")
     args = parser.parse_args()
 
     queries = args.queries or DEFAULT_QUERIES
@@ -489,19 +826,28 @@ def main():
         logger.error("No valid videos found. Run without --skip-download first.")
         return
 
+    # Pre-scan all videos (one-time YOLO inference)
+    use_color = args.color
+    mode_label = "color" if use_color else "width"
+    logger.info(f"\nPre-scanning all videos with YOLO ({mode_label} mode)...")
+    cache, valid = scan_all_videos(model, valid, use_color=use_color)
+
     if args.tune:
-        # Grid search
+        # Grid search using cached scans (fast!)
         logger.info("\n" + "=" * 60)
-        logger.info("PARAMETER GRID SEARCH")
+        logger.info(f"PARAMETER GRID SEARCH ({mode_label.upper()} MODE)")
         logger.info("=" * 60)
 
-        best_params, best_result, all_results = run_grid_search(model, valid)
+        best_params, best_result, all_results = run_grid_search(
+            cache, valid, use_color=use_color
+        )
 
         # Save best params
         BEST_PARAMS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(BEST_PARAMS_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "params": best_params,
+                "mode": mode_label,
                 "accuracy": best_result["accuracy"],
                 "total_videos": best_result["total_videos"],
                 "correct": best_result["correct"],
@@ -517,11 +863,11 @@ def main():
     else:
         # Single benchmark run with current/default params
         logger.info("\n" + "=" * 60)
-        logger.info("BENCHMARK RUN")
+        logger.info(f"BENCHMARK RUN ({mode_label.upper()} MODE)")
         logger.info("=" * 60)
 
         # Use tuned params if available, else defaults
-        params = DEFAULT_PARAMS.copy()
+        params = (DEFAULT_COLOR_PARAMS if use_color else DEFAULT_PARAMS).copy()
         if BEST_PARAMS_FILE.exists():
             try:
                 with open(BEST_PARAMS_FILE, "r") as f:
@@ -531,7 +877,9 @@ def main():
             except Exception:
                 pass
 
-        result = run_benchmark(model, valid, params=params)
+        result = run_benchmark_cached(
+            cache, valid, params=params, use_color=use_color
+        )
 
         logger.info(f"\n{'=' * 60}")
         logger.info(f"RESULTS: {result['correct']}/{result['total_videos']} "
@@ -548,7 +896,7 @@ def main():
             logger.info(f"\nFailed videos ({len(failures)}):")
             for f in failures:
                 logger.info(f"  {f['video']}: detected={f['detected']} "
-                             f"expected={f['expected']} [{f['width_method']}]")
+                             f"expected={f['expected']} [{f.get('method', '')}]")
 
         # Save results
         with open(RESULTS_FILE, "w", encoding="utf-8") as f:
