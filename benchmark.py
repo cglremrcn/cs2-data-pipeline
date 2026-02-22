@@ -17,6 +17,8 @@ import json
 import logging
 import argparse
 import itertools
+import wave
+import subprocess as sp
 from pathlib import Path
 from datetime import datetime
 
@@ -35,6 +37,7 @@ DOWNLOADS_DIR = BASE_DIR / "downloads"
 RESULTS_FILE = BASE_DIR / "benchmark_results.json"
 GROUND_TRUTH_FILE = BASE_DIR / "benchmark_ground_truth.json"
 BEST_PARAMS_FILE = BASE_DIR / "models" / "yolo_params.json"
+NCC_CACHE_FILE = BASE_DIR / "benchmark_ncc_cache.json"
 
 DEFAULT_QUERIES = ["cs2 1k", "cs2 2k", "cs2 3k", "cs2 4k", "cs2 5k"]
 
@@ -599,6 +602,202 @@ def detect_kills_yolo(model, video_path, params=None):
 
 
 # -------------------------------------------------------------------------
+# Audio NCC scanning (player kill sound detection)
+# -------------------------------------------------------------------------
+
+def extract_audio_wav(video_path):
+    """Extract mono WAV audio from video using FFmpeg."""
+    video_path = Path(video_path)
+    audio_path = video_path.parent / (video_path.stem + "_bench.wav")
+    try:
+        sp.run([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1",
+            str(audio_path)
+        ], capture_output=True, check=True, timeout=30)
+        if audio_path.exists() and audio_path.stat().st_size > 1000:
+            return audio_path
+    except Exception:
+        pass
+    if audio_path.exists():
+        audio_path.unlink(missing_ok=True)
+    return None
+
+
+def scan_audio_ncc(video_path):
+    """
+    NCC template match kill_doof_01.wav against video audio.
+    Returns list of (timestamp, ncc_score) tuples at low threshold (0.15)
+    so we can filter by score at benchmark time.
+    """
+    from scipy.signal import fftconvolve, find_peaks
+
+    ref_path = BASE_DIR / "reference_sounds" / "sounds_player_kill_doof_01.wav"
+    if not ref_path.exists():
+        return []
+
+    audio_path = extract_audio_wav(video_path)
+    if not audio_path:
+        return []
+
+    try:
+        with wave.open(str(audio_path), 'rb') as wf:
+            rate = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
+
+        if len(audio) == 0:
+            return []
+
+        # Load and resample reference
+        tmp = audio_path.parent / "_tmp_ref_bench.wav"
+        sp.run([
+            "ffmpeg", "-y", "-i", str(ref_path),
+            "-ar", str(rate), "-ac", "1", "-acodec", "pcm_s16le", str(tmp)
+        ], capture_output=True, check=True, timeout=10)
+
+        with wave.open(str(tmp), 'rb') as wf:
+            ref_raw = wf.readframes(wf.getnframes())
+        ref_audio = np.frombuffer(ref_raw, dtype=np.int16).astype(np.float64) / 32768.0
+        tmp.unlink(missing_ok=True)
+
+        if len(ref_audio) == 0:
+            return []
+
+        # NCC via FFT
+        ref_norm = ref_audio - np.mean(ref_audio)
+        audio_norm = audio - np.mean(audio)
+
+        corr = fftconvolve(audio_norm, ref_norm[::-1], mode='valid')
+
+        ref_energy = np.sqrt(np.sum(ref_norm ** 2))
+        cumsum = np.cumsum(audio_norm ** 2)
+        window = len(ref_norm)
+        local_energy = np.sqrt(
+            cumsum[window:] - np.concatenate([[0], cumsum[:len(cumsum) - window - 1]])
+        )
+
+        min_len = min(len(corr), len(local_energy))
+        ncc = corr[:min_len] / (ref_energy * local_energy[:min_len] + 1e-10)
+
+        # Use low threshold (0.15) so we can filter at benchmark time
+        peaks, props = find_peaks(ncc, height=0.15, distance=int(1.5 * rate))
+
+        return [(round(p / rate, 2), round(float(ncc[p]), 4)) for p in peaks]
+    except Exception as e:
+        logger.warning(f"Audio NCC scan failed for {Path(video_path).name}: {e}")
+        return []
+    finally:
+        if audio_path and audio_path.exists():
+            audio_path.unlink(missing_ok=True)
+
+
+def scan_all_audio(ground_truth):
+    """Pre-scan all videos with NCC audio matching. Returns dict of name -> [(ts, score)]."""
+    cache = {}
+    for entry in ground_truth:
+        video_path = entry.get("video_path", "")
+        if not video_path or not Path(video_path).exists():
+            continue
+        name = Path(video_path).name
+        if name not in cache:
+            logger.info(f"  Audio: {name}...")
+            cache[name] = scan_audio_ncc(video_path)
+            n = len(cache[name])
+            if n:
+                scores = [s for _, s in cache[name]]
+                logger.info(f"    {n} peaks, scores: {min(scores):.3f}-{max(scores):.3f}")
+            else:
+                logger.info(f"    no audio/no peaks")
+    audio_count = sum(1 for v in cache.values() if v)
+    logger.info(f"Audio available: {audio_count}/{len(cache)} videos")
+    return cache
+
+
+# -------------------------------------------------------------------------
+# Audio-filtered detection params
+# -------------------------------------------------------------------------
+
+DEFAULT_AUDIO_PARAMS = {
+    "sim_threshold": 0.55,
+    "cooldown": 2.0,
+    "audio_window": 2.0,
+    "ncc_threshold": 0.30,
+    # Width fallback params
+    "width_ratio_threshold": 0.15,
+    "gap_threshold": 15,
+}
+
+
+def apply_audio_filtered_params(raw_detections, ncc_raw, params=None):
+    """
+    Audio-filtered detection: intersect YOLO transitions with NCC audio peaks.
+    ncc_raw: list of (timestamp, ncc_score) tuples from scan_audio_ncc.
+    Falls back to width heuristic if no audio available.
+    Returns (kill_count, kill_times, method, info).
+    """
+    p = {**DEFAULT_AUDIO_PARAMS, **(params or {})}
+
+    # Get YOLO transitions
+    transitions = []
+    for i, det in enumerate(raw_detections):
+        if i == 0 or det["sim"] < p["sim_threshold"]:
+            transitions.append(det)
+
+    if not transitions:
+        return 0, [], "none", {}
+
+    cooldown = p["cooldown"]
+    audio_window = p.get("audio_window", 2.0)
+    ncc_threshold = p.get("ncc_threshold", 0.30)
+
+    def _dedup_times(times):
+        if not times:
+            return []
+        times = sorted(times)
+        d = [times[0]]
+        for t in times[1:]:
+            if t - d[-1] >= cooldown:
+                d.append(t)
+        return d
+
+    # All transition times (deduped)
+    all_trans_times = _dedup_times([t["ts"] for t in transitions])
+
+    # Filter NCC peaks by threshold
+    ncc_times = [t for t, score in ncc_raw if score >= ncc_threshold] if ncc_raw else []
+
+    if ncc_times:
+        # Intersect: YOLO transitions × NCC audio peaks
+        matched = []
+        for trans_ts in all_trans_times:
+            for ncc_t in ncc_times:
+                if abs(trans_ts - ncc_t) <= audio_window:
+                    matched.append(trans_ts)
+                    break
+
+        if matched:
+            kill_times = _dedup_times(matched)
+            return len(kill_times), kill_times, "audio_filtered", {
+                "ncc_total": len(ncc_raw) if ncc_raw else 0,
+                "ncc_above_thresh": len(ncc_times),
+                "matched": len(matched),
+                "total_transitions": len(all_trans_times),
+            }
+
+        # NCC peaks found but none matched YOLO transitions → use NCC count
+        kill_times = _dedup_times(ncc_times)
+        return len(kill_times), kill_times, "ncc_only", {
+            "ncc_above_thresh": len(ncc_times),
+            "total_transitions": len(all_trans_times),
+        }
+
+    # No audio or no NCC peaks above threshold → width fallback
+    count, times, n_trans, info = apply_params(raw_detections, params)
+    return count, times, info.get("method", "width_fallback"), info
+
+
+# -------------------------------------------------------------------------
 # Benchmark runner
 # -------------------------------------------------------------------------
 
@@ -697,6 +896,80 @@ def run_benchmark_cached(cache, ground_truth, params=None, verbose=True, use_col
     }
 
 
+def run_benchmark_audio_filtered(yolo_cache, audio_cache, ground_truth, params=None, verbose=True):
+    """Run audio-filtered benchmark using cached YOLO + NCC data."""
+    p = params or DEFAULT_AUDIO_PARAMS.copy()
+    correct = 0
+    total = 0
+    details = []
+    by_query = {}
+    method_stats = {}
+
+    for entry in ground_truth:
+        video_path = entry.get("video_path", "")
+        if not video_path:
+            continue
+        name = Path(video_path).name
+        if name not in yolo_cache:
+            continue
+
+        expected = entry["expected_kills"]
+        query = entry.get("query", f"cs2 {expected}k")
+        ncc_raw = audio_cache.get(name, [])
+
+        detected, times, method, info = apply_audio_filtered_params(
+            yolo_cache[name], ncc_raw, params=p
+        )
+
+        is_correct = detected == expected
+        if is_correct:
+            correct += 1
+        total += 1
+
+        method_stats[method] = method_stats.get(method, {"total": 0, "correct": 0})
+        method_stats[method]["total"] += 1
+        if is_correct:
+            method_stats[method]["correct"] += 1
+
+        ncc_thresh = p.get("ncc_threshold", 0.30)
+        ncc_above = len([t for t, s in ncc_raw if s >= ncc_thresh])
+
+        detail = {
+            "video": name,
+            "expected": expected,
+            "detected": detected,
+            "correct": is_correct,
+            "method": method,
+            "ncc_peaks": ncc_above,
+            "ncc_total": len(ncc_raw),
+            "times": [round(t, 1) for t in times],
+        }
+        details.append(detail)
+
+        if query not in by_query:
+            by_query[query] = {"total": 0, "correct": 0}
+        by_query[query]["total"] += 1
+        if is_correct:
+            by_query[query]["correct"] += 1
+
+        if verbose:
+            status = "OK" if is_correct else f"WRONG({detected})"
+            logger.info(f"  {name}: {detected}/{expected} {status} "
+                        f"[{method}, ncc={len(ncc_times)}]")
+
+    accuracy = correct / total if total > 0 else 0
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "params": p,
+        "total_videos": total,
+        "correct": correct,
+        "accuracy": round(accuracy, 4),
+        "by_query": by_query,
+        "method_stats": method_stats,
+        "details": details,
+    }
+
+
 def run_grid_search(cache, ground_truth, use_color=False):
     """Grid search over key parameters using cached video scans."""
     if use_color:
@@ -762,6 +1035,181 @@ def run_grid_search(cache, ground_truth, use_color=False):
     return best_params, best_result, all_results
 
 
+def apply_title_hint_params(raw_detections, ncc_raw, expected_kills, params=None):
+    """
+    Title-hint mode: we know N kills from the title.
+    Select best N transitions from YOLO, scored by audio proximity.
+    Returns (kill_count, kill_times, method, info).
+    """
+    p = {**DEFAULT_AUDIO_PARAMS, **(params or {})}
+    n = expected_kills
+
+    # Get YOLO transitions
+    transitions = []
+    for i, det in enumerate(raw_detections):
+        if i == 0 or det["sim"] < p["sim_threshold"]:
+            transitions.append(det)
+
+    if not transitions:
+        return 0, [], "none", {}
+
+    cooldown = p["cooldown"]
+    audio_window = p.get("audio_window", 2.0)
+    ncc_threshold = p.get("ncc_threshold", 0.30)
+
+    def _dedup_times(times):
+        if not times:
+            return []
+        times = sorted(times)
+        d = [times[0]]
+        for t in times[1:]:
+            if t - d[-1] >= cooldown:
+                d.append(t)
+        return d
+
+    all_trans_times = _dedup_times([t["ts"] for t in transitions])
+
+    if len(all_trans_times) <= n:
+        return len(all_trans_times), all_trans_times, "title_hint_all", {
+            "total_transitions": len(all_trans_times),
+        }
+
+    # Filter NCC peaks by threshold
+    ncc_times = [t for t, score in ncc_raw if score >= ncc_threshold] if ncc_raw else []
+
+    # Score transitions by audio proximity
+    scored = []
+    for ts in all_trans_times:
+        audio_score = 0.0
+        if ncc_times:
+            min_dist = min(abs(ts - nt) for nt in ncc_times)
+            audio_score = max(0, 1.0 - min_dist / audio_window)
+        scored.append((ts, audio_score))
+
+    # Sort by audio score (best first), pick top N
+    scored.sort(key=lambda x: -x[1])
+    kill_times = sorted([ts for ts, _ in scored[:n]])
+
+    return n, kill_times, "title_hint", {
+        "total_transitions": len(all_trans_times),
+        "ncc_peaks": len(ncc_times),
+        "selected": n,
+    }
+
+
+def run_benchmark_title_hint(yolo_cache, audio_cache, ground_truth, params=None, verbose=True):
+    """Benchmark using title-hint mode (expected kills from title)."""
+    p = params or DEFAULT_AUDIO_PARAMS.copy()
+    correct = 0
+    total = 0
+    details = []
+    by_query = {}
+
+    for entry in ground_truth:
+        video_path = entry.get("video_path", "")
+        if not video_path:
+            continue
+        name = Path(video_path).name
+        if name not in yolo_cache:
+            continue
+
+        expected = entry["expected_kills"]
+        query = entry.get("query", f"cs2 {expected}k")
+        ncc_raw = audio_cache.get(name, [])
+
+        detected, times, method, info = apply_title_hint_params(
+            yolo_cache[name], ncc_raw, expected, params=p
+        )
+
+        is_correct = detected == expected
+        if is_correct:
+            correct += 1
+        total += 1
+
+        detail = {
+            "video": name,
+            "expected": expected,
+            "detected": detected,
+            "correct": is_correct,
+            "method": method,
+            "times": [round(t, 1) for t in times],
+        }
+        details.append(detail)
+
+        if query not in by_query:
+            by_query[query] = {"total": 0, "correct": 0}
+        by_query[query]["total"] += 1
+        if is_correct:
+            by_query[query]["correct"] += 1
+
+        if verbose:
+            status = "OK" if is_correct else f"WRONG({detected})"
+            logger.info(f"  {name}: {detected}/{expected} {status} [{method}]")
+
+    accuracy = correct / total if total > 0 else 0
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "params": p,
+        "total_videos": total,
+        "correct": correct,
+        "accuracy": round(accuracy, 4),
+        "by_query": by_query,
+        "details": details,
+    }
+
+
+def run_audio_grid_search(yolo_cache, audio_cache, ground_truth):
+    """Grid search over audio-filtered parameters."""
+    param_grid = {
+        "sim_threshold": [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75],
+        "cooldown": [1.0, 1.5, 2.0, 2.5, 3.0],
+        "audio_window": [1.0, 1.5, 2.0, 2.5, 3.0],
+        "ncc_threshold": [0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60],
+        "width_ratio_threshold": [0.10, 0.15, 0.20, 0.25],
+        "gap_threshold": [10, 15, 20, 30],
+    }
+
+    fixed = {"sample_fps": 4, "conf": 0.45}
+
+    keys = list(param_grid.keys())
+    values = list(param_grid.values())
+    combos = list(itertools.product(*values))
+
+    logger.info(f"Audio-filtered grid search: {len(combos)} combinations")
+
+    best_accuracy = -1
+    best_params = None
+    best_result = None
+
+    for i, combo in enumerate(combos, 1):
+        params = {**fixed}
+        for k, v in zip(keys, combo):
+            params[k] = v
+
+        result = run_benchmark_audio_filtered(
+            yolo_cache, audio_cache, ground_truth, params=params, verbose=False
+        )
+        acc = result["accuracy"]
+
+        if acc > best_accuracy:
+            best_accuracy = acc
+            best_params = params.copy()
+            best_result = result
+
+        if i % 500 == 0 or i == len(combos):
+            logger.info(f"  [{i}/{len(combos)}] Best: {best_accuracy:.1%} "
+                        f"({best_result['correct']}/{best_result['total_videos']})")
+
+    logger.info(f"\nBest accuracy: {best_accuracy:.1%}")
+    logger.info(f"Best params: {best_params}")
+    if best_result and "method_stats" in best_result:
+        for m, s in best_result["method_stats"].items():
+            acc = s["correct"] / s["total"] if s["total"] > 0 else 0
+            logger.info(f"  {m}: {s['correct']}/{s['total']} ({acc:.0%})")
+
+    return best_params, best_result
+
+
 # -------------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------------
@@ -778,6 +1226,10 @@ def main():
                         help="Run parameter grid search")
     parser.add_argument("--color", action="store_true",
                         help="Use color-based detection (red highlight + team color)")
+    parser.add_argument("--audio-filter", action="store_true",
+                        help="Use audio-filtered detection (NCC × YOLO intersection)")
+    parser.add_argument("--title-hint", action="store_true",
+                        help="Use title kill count as hint (simulates production with title)")
     args = parser.parse_args()
 
     queries = args.queries or DEFAULT_QUERIES
@@ -826,13 +1278,153 @@ def main():
         logger.error("No valid videos found. Run without --skip-download first.")
         return
 
-    # Pre-scan all videos (one-time YOLO inference)
-    use_color = args.color
-    mode_label = "color" if use_color else "width"
-    logger.info(f"\nPre-scanning all videos with YOLO ({mode_label} mode)...")
+    # Pre-scan all videos with YOLO (basic mode for audio-filter, color optional)
+    use_color = args.color and not args.audio_filter
+    mode_label = "audio-filter" if args.audio_filter else ("color" if use_color else "width")
+    logger.info(f"\nPre-scanning all videos with YOLO...")
     cache, valid = scan_all_videos(model, valid, use_color=use_color)
 
-    if args.tune:
+    # Audio scanning (for audio-filter mode) with cache
+    audio_cache = {}
+    if args.audio_filter:
+        if NCC_CACHE_FILE.exists():
+            with open(NCC_CACHE_FILE, "r") as f:
+                audio_cache = json.load(f)
+            # Convert lists back to tuples
+            for k, v in audio_cache.items():
+                audio_cache[k] = [tuple(x) for x in v]
+            logger.info(f"Loaded NCC cache: {len(audio_cache)} videos")
+        else:
+            logger.info("\nPre-scanning audio with NCC template matching...")
+            audio_cache = scan_all_audio(valid)
+            # Save cache
+            with open(NCC_CACHE_FILE, "w") as f:
+                json.dump({k: list(v) for k, v in audio_cache.items()}, f)
+            logger.info(f"NCC cache saved to {NCC_CACHE_FILE}")
+
+        # Quick NCC direct analysis
+        logger.info("\n--- NCC Direct Count Analysis ---")
+        for thresh in [0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60]:
+            correct = 0
+            total = 0
+            for entry in valid:
+                name = Path(entry.get("video_path", "")).name
+                ncc_raw = audio_cache.get(name, [])
+                if not ncc_raw:
+                    continue
+                count = len([1 for t, s in ncc_raw if s >= thresh])
+                if count == entry["expected_kills"]:
+                    correct += 1
+                total += 1
+            logger.info(f"  NCC direct (thresh={thresh:.2f}): "
+                        f"{correct}/{total} ({correct/total:.0%})")
+
+    if args.title_hint:
+        # Title-hint mode: use expected kills from title
+        logger.info("\n" + "=" * 60)
+        logger.info("TITLE-HINT BENCHMARK")
+        logger.info("=" * 60)
+
+        params = DEFAULT_AUDIO_PARAMS.copy()
+        if BEST_PARAMS_FILE.exists():
+            try:
+                with open(BEST_PARAMS_FILE, "r") as f:
+                    saved = json.load(f)
+                params.update(saved.get("params", {}))
+            except Exception:
+                pass
+
+        result = run_benchmark_title_hint(
+            cache, audio_cache, valid, params=params
+        )
+
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"RESULTS: {result['correct']}/{result['total_videos']} "
+                     f"({result['accuracy']:.1%} accuracy)")
+        for query, stats in sorted(result["by_query"].items()):
+            acc = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
+            logger.info(f"  {query}: {stats['correct']}/{stats['total']} ({acc:.0%})")
+
+        failures = [d for d in result["details"] if not d["correct"]]
+        if failures:
+            logger.info(f"\nFailed ({len(failures)}):")
+            for f in failures:
+                logger.info(f"  {f['video']}: det={f['detected']} exp={f['expected']} "
+                             f"[{f['method']}]")
+
+        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        logger.info(f"\nResults saved to {RESULTS_FILE}")
+        return
+
+    if args.audio_filter and args.tune:
+        # Audio-filtered grid search
+        logger.info("\n" + "=" * 60)
+        logger.info("AUDIO-FILTERED GRID SEARCH")
+        logger.info("=" * 60)
+
+        best_params, best_result = run_audio_grid_search(cache, audio_cache, valid)
+
+        # Save best params
+        BEST_PARAMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BEST_PARAMS_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "params": best_params,
+                "mode": "audio_filter",
+                "accuracy": best_result["accuracy"],
+                "total_videos": best_result["total_videos"],
+                "correct": best_result["correct"],
+                "method_stats": best_result.get("method_stats", {}),
+                "tuned_at": datetime.now().isoformat(),
+            }, f, indent=2)
+        logger.info(f"Best params saved to {BEST_PARAMS_FILE}")
+
+        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(best_result, f, indent=2, ensure_ascii=False)
+        logger.info(f"Results saved to {RESULTS_FILE}")
+
+    elif args.audio_filter:
+        # Single audio-filtered benchmark
+        logger.info("\n" + "=" * 60)
+        logger.info("AUDIO-FILTERED BENCHMARK")
+        logger.info("=" * 60)
+
+        params = DEFAULT_AUDIO_PARAMS.copy()
+        if BEST_PARAMS_FILE.exists():
+            try:
+                with open(BEST_PARAMS_FILE, "r") as f:
+                    saved = json.load(f)
+                params.update(saved.get("params", {}))
+            except Exception:
+                pass
+
+        result = run_benchmark_audio_filtered(
+            cache, audio_cache, valid, params=params
+        )
+
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"RESULTS: {result['correct']}/{result['total_videos']} "
+                     f"({result['accuracy']:.1%} accuracy)")
+        logger.info(f"Params: {result['params']}")
+        for m, s in result.get("method_stats", {}).items():
+            acc = s["correct"] / s["total"] if s["total"] > 0 else 0
+            logger.info(f"  {m}: {s['correct']}/{s['total']} ({acc:.0%})")
+        for query, stats in sorted(result["by_query"].items()):
+            acc = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
+            logger.info(f"  {query}: {stats['correct']}/{stats['total']} ({acc:.0%})")
+
+        failures = [d for d in result["details"] if not d["correct"]]
+        if failures:
+            logger.info(f"\nFailed ({len(failures)}):")
+            for f in failures:
+                logger.info(f"  {f['video']}: det={f['detected']} exp={f['expected']} "
+                             f"[{f['method']}, ncc={f.get('ncc_peaks', 0)}]")
+
+        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        logger.info(f"\nResults saved to {RESULTS_FILE}")
+
+    elif args.tune:
         # Grid search using cached scans (fast!)
         logger.info("\n" + "=" * 60)
         logger.info(f"PARAMETER GRID SEARCH ({mode_label.upper()} MODE)")
