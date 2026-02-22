@@ -114,15 +114,20 @@ class CS2DataPipeline:
         """Load tuned YOLO detection parameters from JSON if available."""
         params_path = self.base_dir / "models" / "yolo_params.json"
         defaults = {
-            "sample_fps": 4, "conf": 0.45, "sim_threshold": 0.6,
-            "width_ratio_threshold": 0.15, "gap_threshold": 15, "cooldown": 2.0,
+            "sample_fps": 4, "conf": 0.45, "sim_threshold": 0.55,
+            "cooldown": 2.0,
+            "red_highlight_threshold": 0.08,
+            "team_color_min_votes": 2,
+            # Width fallback
+            "width_ratio_threshold": 0.15, "gap_threshold": 15,
         }
         if params_path.exists():
             try:
                 with open(params_path, "r") as f:
                     saved = json.load(f)
                 defaults.update(saved.get("params", {}))
-                logger.info(f"YOLO params loaded from {params_path}")
+                mode = saved.get("mode", "width")
+                logger.info(f"YOLO params loaded from {params_path} (mode={mode})")
             except Exception:
                 pass
         return defaults
@@ -259,18 +264,37 @@ class CS2DataPipeline:
         else:
             logger.info("No audio stream — using YOLO-only detection")
 
-        # --- Decision: pick best result ---
-        # YOLO width-based detection is validated on 3/3 test videos.
-        # Prefer YOLO when it gives a reasonable count; fall back to NCC.
+        # --- Decision: YOLO + audio cross-reference ---
         if len(yolo_dets) >= 2:
             result = yolo_dets
-            logger.info(f"Using YOLO kill feed result ({len(result)} kills)")
+            logger.info(f"Using YOLO color-based result ({len(result)} kills)")
+
+            # Cross-reference with audio if available
+            if ncc_verified:
+                yolo_times = {d["timestamp"] for d in result}
+                supplementary = []
+                for ncc_det in ncc_verified:
+                    ncc_ts = ncc_det["timestamp"]
+                    # Check if any YOLO detection is within ±1.5s
+                    matched = any(abs(ncc_ts - yt) <= 1.5 for yt in yolo_times)
+                    if not matched:
+                        # Unmatched audio event — potential supplementary kill
+                        cooldown = self._yolo_params.get("cooldown", 2.0)
+                        all_times = yolo_times | {s["timestamp"] for s in supplementary}
+                        if all(abs(ncc_ts - t) >= cooldown for t in all_times):
+                            ncc_det["detection_method"] = "ncc_supplementary"
+                            supplementary.append(ncc_det)
+
+                if supplementary:
+                    logger.info(f"Audio cross-ref: {len(supplementary)} supplementary kills from NCC")
+                    result = sorted(result + supplementary, key=lambda d: d["timestamp"])
+
         elif ncc_verified:
             result = ncc_verified
             logger.info(f"Using NCC-verified result ({len(result)} kills)")
         elif yolo_dets:
             result = yolo_dets
-            logger.info(f"Using YOLO kill feed result ({len(result)} kills)")
+            logger.info(f"Using YOLO result ({len(result)} kills)")
         else:
             logger.info("No kills detected by any method")
             result = []
@@ -418,10 +442,64 @@ class CS2DataPipeline:
             return 0.0
         return float(np.dot(fa, fb) / (na * nb))
 
+    @staticmethod
+    def _extract_color_features(frame, x1, y1, x2, y2):
+        """
+        Extract color features from a kill feed entry bounding box.
+        Returns dict with red_ratio, killer_hue/team, victim_hue/team.
+        """
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return {"red_ratio": 0.0, "killer_hue": -1, "killer_team": "unknown",
+                    "victim_hue": -1, "victim_team": "unknown"}
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+        # Red highlight: background pixels with red hue
+        bg_mask = (v_ch > 15) & (v_ch < 100)
+        bg_count = np.count_nonzero(bg_mask)
+        if bg_count > 0:
+            red_mask = bg_mask & (s_ch > 30) & ((h_ch < 15) | (h_ch > 165))
+            red_ratio = float(np.count_nonzero(red_mask)) / bg_count
+        else:
+            red_ratio = 0.0
+
+        def _text_hue(region):
+            if region.size == 0:
+                return -1, "unknown"
+            rh, rs, rv = region[:, :, 0], region[:, :, 1], region[:, :, 2]
+            mask = (rv > 120) & (rs > 60)
+            hues = rh[mask]
+            if len(hues) < 3:
+                return -1, "unknown"
+            med = float(np.median(hues))
+            if 5 <= med <= 25:
+                team = "T"
+            elif 90 <= med <= 120:
+                team = "CT"
+            else:
+                team = "unknown"
+            return round(med, 1), team
+
+        w = crop.shape[1]
+        left_w = max(1, int(w * 0.25))
+        killer_hue, killer_team = _text_hue(hsv[:, :left_w, :])
+        right_start = max(0, w - left_w)
+        victim_hue, victim_team = _text_hue(hsv[:, right_start:, :])
+
+        return {
+            "red_ratio": round(red_ratio, 4),
+            "killer_hue": killer_hue,
+            "killer_team": killer_team,
+            "victim_hue": victim_hue,
+            "victim_team": victim_team,
+        }
+
     def _detect_kills_yolo_killfeed(self, video_path, fps, width, height):
         """
-        Detect player's kills by tracking kill feed entry transitions and
-        filtering by box width. Wider entries = player's kills (longer name).
+        Detect player's kills using YOLO kill feed detection with color-based
+        classification. Priority: red highlight → team color → width fallback.
 
         Returns list of detection dicts matching pipeline format.
         """
@@ -443,7 +521,7 @@ class CS2DataPipeline:
         interval = max(1, int(fps / p["sample_fps"]))
         frame_idx = 0
         prev_sig = None
-        transitions = []
+        all_detections = []
 
         while True:
             ret, frame = cap.read()
@@ -479,30 +557,32 @@ class CS2DataPipeline:
                         )
                         sim = (self._compare_signatures(sig, prev_sig)
                                if prev_sig is not None else 0.0)
-                        if prev_sig is None or sim < p["sim_threshold"]:
-                            transitions.append({"ts": round(ts, 2), "bw": bw})
+
+                        # Extract color features from full bounding box
+                        color = self._extract_color_features(frame, x1, y1, x2, y2)
+
+                        all_detections.append({
+                            "ts": round(ts, 2), "bw": bw,
+                            "sim": round(sim, 4), **color,
+                        })
                         prev_sig = sig
 
             frame_idx += 1
         cap.release()
 
-        if len(transitions) < 3:
+        # Filter transitions by similarity
+        sim_thresh = p.get("sim_threshold", 0.55)
+        transitions = []
+        for i, det in enumerate(all_detections):
+            if i == 0 or det["sim"] < sim_thresh:
+                transitions.append(det)
+
+        if not transitions:
             return []
 
         logger.info(f"  YOLO transitions: {len(transitions)}")
 
-        # Split by box width: gap-based and mean-based
-        all_widths = [t["bw"] for t in transitions]
-        widths = sorted(set(all_widths))
-        max_gap = 0
-        gap_idx = 0
-        for i in range(len(widths) - 1):
-            gap = widths[i + 1] - widths[i]
-            if gap > max_gap:
-                max_gap = gap
-                gap_idx = i
-
-        cooldown = p["cooldown"]
+        cooldown = p.get("cooldown", 2.0)
 
         def _dedup(entries):
             if not entries:
@@ -514,37 +594,74 @@ class CS2DataPipeline:
                     d.append(t)
             return d
 
-        # Check if widths are homogeneous (all same player's kills)
-        width_range = max(all_widths) - min(all_widths)
-        width_mean = np.mean(all_widths)
-        width_ratio = width_range / width_mean if width_mean > 0 else 0
-
-        if width_ratio < p["width_ratio_threshold"] and max_gap < p["gap_threshold"]:
-            # All transitions have similar width — likely all same player
-            kill_times = _dedup(transitions)
-            logger.info(f"  Width homogeneous (range={width_range}px, "
-                        f"ratio={width_ratio:.3f}), using all transitions")
+        # --- Priority 1: Red highlight ---
+        red_thresh = p.get("red_highlight_threshold", 0.08)
+        red_transitions = [t for t in transitions if t.get("red_ratio", 0) >= red_thresh]
+        if red_transitions:
+            kill_times = _dedup(red_transitions)
+            method = "red_highlight"
+            logger.info(f"  Color: red highlight ({len(red_transitions)} entries >= "
+                        f"{red_thresh}), {len(kill_times)} kills")
         else:
-            # Gap-based split
-            if max_gap >= p["gap_threshold"]:
-                gap_thresh = (widths[gap_idx] + widths[gap_idx + 1]) / 2
-            else:
-                gap_thresh = width_mean
-            gap_times = _dedup([t for t in transitions if t["bw"] >= gap_thresh])
+            # --- Priority 2: Team color voting ---
+            team_votes = {"T": 0, "CT": 0, "unknown": 0}
+            for t in transitions:
+                kt = t.get("killer_team", "unknown")
+                team_votes[kt] = team_votes.get(kt, 0) + 1
 
-            # Mean-based split
-            mean_times = _dedup([t for t in transitions if t["bw"] >= width_mean])
+            t_count = team_votes.get("T", 0)
+            ct_count = team_votes.get("CT", 0)
+            team_min = p.get("team_color_min_votes", 2)
+            kill_times = None
 
-            # Take the more selective (lower count) result
-            if len(gap_times) <= len(mean_times):
-                kill_times = gap_times
-                logger.info(f"  Width split: gap-based ({max_gap}px gap), "
-                            f"threshold={gap_thresh:.0f}")
-            else:
-                kill_times = mean_times
-                logger.info(f"  Width split: mean-based, threshold={width_mean:.0f}")
+            if t_count >= team_min or ct_count >= team_min:
+                player_team = "T" if t_count > ct_count else ("CT" if ct_count > t_count else None)
+                if player_team:
+                    team_trans = [t for t in transitions
+                                  if t.get("killer_team") == player_team]
+                    if team_trans:
+                        kill_times = _dedup(team_trans)
+                        method = "team_color"
+                        logger.info(f"  Color: team={player_team} ({len(team_trans)} entries), "
+                                    f"votes={team_votes}, {len(kill_times)} kills")
 
-        logger.info(f"  YOLO kills: {len(kill_times)} at "
+            if kill_times is None:
+                # --- Priority 3: Width fallback ---
+                if len(transitions) < 3:
+                    kill_times = [t["ts"] for t in transitions]
+                    method = "width_too_few"
+                else:
+                    all_widths = [t["bw"] for t in transitions]
+                    widths = sorted(set(all_widths))
+                    max_gap = 0
+                    gap_idx = 0
+                    for i in range(len(widths) - 1):
+                        gap = widths[i + 1] - widths[i]
+                        if gap > max_gap:
+                            max_gap = gap
+                            gap_idx = i
+
+                    width_range = max(all_widths) - min(all_widths)
+                    width_mean = np.mean(all_widths)
+                    width_ratio = width_range / width_mean if width_mean > 0 else 0
+                    wrt = p.get("width_ratio_threshold", 0.15)
+                    gt = p.get("gap_threshold", 15)
+
+                    if width_ratio < wrt and max_gap < gt:
+                        kill_times = _dedup(transitions)
+                        method = "width_homogeneous"
+                    else:
+                        if max_gap >= gt:
+                            gap_thresh = (widths[gap_idx] + widths[gap_idx + 1]) / 2
+                        else:
+                            gap_thresh = width_mean
+                        gap_times = _dedup([t for t in transitions if t["bw"] >= gap_thresh])
+                        mean_times = _dedup([t for t in transitions if t["bw"] >= width_mean])
+                        kill_times = gap_times if len(gap_times) <= len(mean_times) else mean_times
+                        method = "width_split"
+                    logger.info(f"  Width fallback: {method}, {len(kill_times)} kills")
+
+        logger.info(f"  YOLO kills ({method}): {len(kill_times)} at "
                     f"{[f'{t:.1f}' for t in kill_times]}")
 
         # Build detection dicts
@@ -553,8 +670,8 @@ class CS2DataPipeline:
             detections.append({
                 "timestamp": ts,
                 "frame_number": int(ts * fps),
-                "confidence": 0.8,
-                "detection_method": "yolo_killfeed",
+                "confidence": 0.85 if method.startswith("red") else 0.8,
+                "detection_method": f"yolo_killfeed_{method}",
             })
 
         return detections
