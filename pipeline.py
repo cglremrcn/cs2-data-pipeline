@@ -108,6 +108,24 @@ class CS2DataPipeline:
             logger.warning(f"ML model load failed: {e} — using NCC fallback")
 
         self._yolo_model = None
+        self._yolo_params = self._load_yolo_params()
+
+    def _load_yolo_params(self):
+        """Load tuned YOLO detection parameters from JSON if available."""
+        params_path = self.base_dir / "models" / "yolo_params.json"
+        defaults = {
+            "sample_fps": 4, "conf": 0.45, "sim_threshold": 0.6,
+            "width_ratio_threshold": 0.15, "gap_threshold": 15, "cooldown": 2.0,
+        }
+        if params_path.exists():
+            try:
+                with open(params_path, "r") as f:
+                    saved = json.load(f)
+                defaults.update(saved.get("params", {}))
+                logger.info(f"YOLO params loaded from {params_path}")
+            except Exception:
+                pass
+        return defaults
 
     def _load_yolo_model(self):
         """Lazy-load YOLO kill feed detection model."""
@@ -411,6 +429,8 @@ class CS2DataPipeline:
         if model is None:
             return []
 
+        p = self._yolo_params
+
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             return []
@@ -420,8 +440,7 @@ class CS2DataPipeline:
         max_y = int(height * 0.22)
         min_y = int(height * 0.02)
 
-        sample_fps = 4
-        interval = max(1, int(fps / sample_fps))
+        interval = max(1, int(fps / p["sample_fps"]))
         frame_idx = 0
         prev_sig = None
         transitions = []
@@ -432,7 +451,7 @@ class CS2DataPipeline:
                 break
             if frame_idx % interval == 0:
                 ts = frame_idx / fps
-                results = model(frame, conf=0.45, verbose=False)
+                results = model(frame, conf=p["conf"], verbose=False)
                 best = None
                 for r in results:
                     if r.boxes is None:
@@ -460,7 +479,7 @@ class CS2DataPipeline:
                         )
                         sim = (self._compare_signatures(sig, prev_sig)
                                if prev_sig is not None else 0.0)
-                        if prev_sig is None or sim < 0.6:
+                        if prev_sig is None or sim < p["sim_threshold"]:
                             transitions.append({"ts": round(ts, 2), "bw": bw})
                         prev_sig = sig
 
@@ -483,7 +502,7 @@ class CS2DataPipeline:
                 max_gap = gap
                 gap_idx = i
 
-        cooldown = 2.0
+        cooldown = p["cooldown"]
 
         def _dedup(entries):
             if not entries:
@@ -500,14 +519,14 @@ class CS2DataPipeline:
         width_mean = np.mean(all_widths)
         width_ratio = width_range / width_mean if width_mean > 0 else 0
 
-        if width_ratio < 0.15 and max_gap < 15:
+        if width_ratio < p["width_ratio_threshold"] and max_gap < p["gap_threshold"]:
             # All transitions have similar width — likely all same player
             kill_times = _dedup(transitions)
             logger.info(f"  Width homogeneous (range={width_range}px, "
                         f"ratio={width_ratio:.3f}), using all transitions")
         else:
             # Gap-based split
-            if max_gap >= 15:
+            if max_gap >= p["gap_threshold"]:
                 gap_thresh = (widths[gap_idx] + widths[gap_idx + 1]) / 2
             else:
                 gap_thresh = width_mean
