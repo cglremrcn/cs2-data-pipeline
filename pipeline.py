@@ -6,6 +6,7 @@ Processes Medal.tv clips to detect kill moments and extract labeled clips.
 import subprocess
 import json
 import logging
+import re
 import time
 import wave
 import threading
@@ -204,6 +205,44 @@ class CS2DataPipeline:
             raise RuntimeError(f"Video download failed: {e.stderr[:200]}")
         except subprocess.TimeoutExpired:
             raise RuntimeError("Video download timed out (180s)")
+
+    def _extract_title(self, url):
+        """Extract video title from Medal.tv URL using yt-dlp metadata."""
+        try:
+            result = subprocess.run(
+                ["yt-dlp", "--print", "title", "--skip-download", "--no-playlist", url],
+                capture_output=True, text=True, timeout=30
+            )
+            title = result.stdout.strip()
+            if title:
+                logger.info(f"Video title: {title}")
+                return title
+        except Exception as e:
+            logger.warning(f"Could not extract title: {e}")
+        return None
+
+    @staticmethod
+    def _parse_kill_count(title):
+        """Parse kill count from Medal.tv title. Returns int or None."""
+        if not title:
+            return None
+        t = title.lower()
+        # Match "ace" = 5 kills
+        if re.search(r'\bace\b', t):
+            return 5
+        # Match "1k" through "9k" (with optional separators)
+        m = re.search(r'\b([1-9])k\b', t)
+        if m:
+            return int(m.group(1))
+        # Match "#5k" style
+        m = re.search(r'#([1-9])k\b', t)
+        if m:
+            return int(m.group(1))
+        # Match "[2k]" style
+        m = re.search(r'\[([1-9])k\]', t)
+        if m:
+            return int(m.group(1))
+        return None
 
     # =========================================================================
     # Phase 2: Kill Detection
@@ -1564,9 +1603,17 @@ class CS2DataPipeline:
             video_path = self.download_video(url, progress_callback)
             result["video_path"] = str(video_path)
 
+            # Extract title and parse kill count for title-hint mode
+            title = self._extract_title(url)
+            expected_kills = self._parse_kill_count(title)
+            if expected_kills:
+                logger.info(f"Title-hint: expecting {expected_kills} kills from title")
+            result["title"] = title
+            result["expected_kills"] = expected_kills
+
             # Phase 2: Detect
             logger.info("[2/4] Detecting kill moments...")
-            detections = self.detect_kills(video_path, progress_callback)
+            detections = self.detect_kills(video_path, progress_callback, expected_kills=expected_kills)
             result["kills_detected"] = len(detections)
 
             if not detections:
