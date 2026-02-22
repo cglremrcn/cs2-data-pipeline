@@ -250,7 +250,7 @@ def _classify_team(hue):
     return "unknown"
 
 
-def scan_video_yolo(model, video_path):
+def scan_video_yolo(model, video_path, sample_fps=4, conf=0.45):
     """
     Run YOLO inference on video ONCE. Cache all frame detections with
     timestamps, widths, and pairwise similarities.
@@ -272,7 +272,6 @@ def scan_video_yolo(model, video_path):
     max_y = int(h * 0.22)
     min_y = int(h * 0.02)
 
-    sample_fps = 4
     interval = max(1, int(fps / sample_fps))
     frame_idx = 0
     prev_sig = None
@@ -284,7 +283,7 @@ def scan_video_yolo(model, video_path):
             break
         if frame_idx % interval == 0:
             ts = frame_idx / fps
-            results = model(frame, conf=0.45, verbose=False)
+            results = model(frame, conf=conf, verbose=False)
             best = None
             for r in results:
                 if r.boxes is None:
@@ -815,12 +814,11 @@ def save_ground_truth(entries):
         json.dump(entries, f, indent=2, ensure_ascii=False)
 
 
-def scan_all_videos(model, ground_truth, use_color=True):
+def scan_all_videos(model, ground_truth, use_color=True, sample_fps=4, conf=0.45):
     """Pre-scan all videos with YOLO. Returns dict of video_name -> raw_detections."""
     cache = {}
     valid = []
-    scan_fn = scan_video_yolo_color if use_color else scan_video_yolo
-    label = "color" if use_color else "basic"
+    label = "color" if use_color else f"fps={sample_fps},conf={conf}"
     for entry in ground_truth:
         video_path = entry.get("video_path", "")
         if not video_path or not Path(video_path).exists():
@@ -828,7 +826,11 @@ def scan_all_videos(model, ground_truth, use_color=True):
         name = Path(video_path).name
         if name not in cache:
             logger.info(f"  Scanning ({label}) {name}...")
-            cache[name] = scan_fn(model, video_path)
+            if use_color:
+                cache[name] = scan_video_yolo_color(model, video_path)
+            else:
+                cache[name] = scan_video_yolo(model, video_path,
+                                              sample_fps=sample_fps, conf=conf)
         valid.append(entry)
     logger.info(f"Scanned {len(cache)} videos, {sum(len(v) for v in cache.values())} raw detections")
     return cache, valid
@@ -1039,23 +1041,21 @@ def apply_title_hint_params(raw_detections, ncc_raw, expected_kills, params=None
     """
     Title-hint mode: we know N kills from the title.
     Select best N transitions from YOLO, scored by audio proximity.
+    When YOLO under-detects, supplement with NCC audio peaks.
     Returns (kill_count, kill_times, method, info).
     """
     p = {**DEFAULT_AUDIO_PARAMS, **(params or {})}
     n = expected_kills
+
+    cooldown = p["cooldown"]
+    audio_window = p.get("audio_window", 2.0)
+    ncc_threshold = p.get("ncc_threshold", 0.30)
 
     # Get YOLO transitions
     transitions = []
     for i, det in enumerate(raw_detections):
         if i == 0 or det["sim"] < p["sim_threshold"]:
             transitions.append(det)
-
-    if not transitions:
-        return 0, [], "none", {}
-
-    cooldown = p["cooldown"]
-    audio_window = p.get("audio_window", 2.0)
-    ncc_threshold = p.get("ncc_threshold", 0.30)
 
     def _dedup_times(times):
         if not times:
@@ -1069,31 +1069,60 @@ def apply_title_hint_params(raw_detections, ncc_raw, expected_kills, params=None
 
     all_trans_times = _dedup_times([t["ts"] for t in transitions])
 
-    if len(all_trans_times) <= n:
-        return len(all_trans_times), all_trans_times, "title_hint_all", {
-            "total_transitions": len(all_trans_times),
+    # Filter NCC peaks by threshold
+    ncc_peaks = [(t, score) for t, score in ncc_raw if score >= ncc_threshold] if ncc_raw else []
+    ncc_times = [t for t, _ in ncc_peaks]
+
+    if not all_trans_times and not ncc_times:
+        return 0, [], "none", {}
+
+    if not all_trans_times and ncc_times:
+        # No YOLO transitions at all — use NCC peaks directly
+        ncc_sorted = sorted(ncc_peaks, key=lambda x: -x[1])
+        ncc_selected = _dedup_times([t for t, _ in ncc_sorted[:n * 2]])[:n]
+        return len(ncc_selected), ncc_selected, "ncc_fallback", {
+            "ncc_peaks": len(ncc_times),
         }
 
-    # Filter NCC peaks by threshold
-    ncc_times = [t for t, score in ncc_raw if score >= ncc_threshold] if ncc_raw else []
+    if len(all_trans_times) >= n:
+        # Enough YOLO transitions — score by audio and pick best N
+        scored = []
+        for ts in all_trans_times:
+            audio_score = 0.0
+            if ncc_times:
+                min_dist = min(abs(ts - nt) for nt in ncc_times)
+                audio_score = max(0, 1.0 - min_dist / audio_window)
+            scored.append((ts, audio_score))
 
-    # Score transitions by audio proximity
-    scored = []
-    for ts in all_trans_times:
-        audio_score = 0.0
-        if ncc_times:
-            min_dist = min(abs(ts - nt) for nt in ncc_times)
-            audio_score = max(0, 1.0 - min_dist / audio_window)
-        scored.append((ts, audio_score))
+        scored.sort(key=lambda x: -x[1])
+        kill_times = sorted([ts for ts, _ in scored[:n]])
 
-    # Sort by audio score (best first), pick top N
-    scored.sort(key=lambda x: -x[1])
-    kill_times = sorted([ts for ts, _ in scored[:n]])
+        return n, kill_times, "title_hint", {
+            "total_transitions": len(all_trans_times),
+            "ncc_peaks": len(ncc_times),
+            "selected": n,
+        }
 
-    return n, kill_times, "title_hint", {
+    # YOLO under-detected: supplement with NCC peaks
+    yolo_times = set(all_trans_times)
+    remaining = n - len(all_trans_times)
+
+    # Find NCC peaks not overlapping with existing YOLO transitions
+    unmatched_ncc = []
+    for nt, score in ncc_peaks:
+        if not any(abs(nt - yt) <= audio_window for yt in yolo_times):
+            unmatched_ncc.append((nt, score))
+
+    # Sort by score (best first), pick enough to fill the gap
+    unmatched_ncc.sort(key=lambda x: -x[1])
+    supplement_times = _dedup_times([t for t, _ in unmatched_ncc[:remaining * 2]])[:remaining]
+
+    kill_times = sorted(list(all_trans_times) + supplement_times)
+
+    return len(kill_times), kill_times, "title_hint_ncc_supp", {
         "total_transitions": len(all_trans_times),
         "ncc_peaks": len(ncc_times),
-        "selected": n,
+        "supplemented": len(supplement_times),
     }
 
 
@@ -1210,6 +1239,50 @@ def run_audio_grid_search(yolo_cache, audio_cache, ground_truth):
     return best_params, best_result
 
 
+def run_title_hint_grid_search(yolo_cache, audio_cache, ground_truth):
+    """Grid search over title-hint parameters (with NCC supplementary)."""
+    param_grid = {
+        "sim_threshold": [0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+        "cooldown": [0.8, 1.0, 1.5, 2.0, 2.5],
+        "audio_window": [1.5, 2.0, 2.5, 3.0, 4.0],
+        "ncc_threshold": [0.20, 0.25, 0.30, 0.35, 0.40],
+    }
+
+    keys = list(param_grid.keys())
+    values = list(param_grid.values())
+    combos = list(itertools.product(*values))
+
+    logger.info(f"Title-hint grid search: {len(combos)} combinations")
+
+    best_accuracy = -1
+    best_params = None
+    best_result = None
+
+    for i, combo in enumerate(combos, 1):
+        params = {}
+        for k, v in zip(keys, combo):
+            params[k] = v
+
+        result = run_benchmark_title_hint(
+            yolo_cache, audio_cache, ground_truth, params=params, verbose=False
+        )
+        acc = result["accuracy"]
+
+        if acc > best_accuracy:
+            best_accuracy = acc
+            best_params = params.copy()
+            best_result = result
+
+        if i % 200 == 0 or i == len(combos):
+            logger.info(f"  [{i}/{len(combos)}] Best: {best_accuracy:.1%} "
+                        f"({best_result['correct']}/{best_result['total_videos']})")
+
+    logger.info(f"\nBest title-hint accuracy: {best_accuracy:.1%}")
+    logger.info(f"Best params: {best_params}")
+
+    return best_params, best_result
+
+
 # -------------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------------
@@ -1230,6 +1303,10 @@ def main():
                         help="Use audio-filtered detection (NCC × YOLO intersection)")
     parser.add_argument("--title-hint", action="store_true",
                         help="Use title kill count as hint (simulates production with title)")
+    parser.add_argument("--sample-fps", type=int, default=4,
+                        help="YOLO sampling FPS (default: 4, try 6-8 for more transitions)")
+    parser.add_argument("--conf", type=float, default=0.45,
+                        help="YOLO confidence threshold (default: 0.45, try 0.30-0.40)")
     args = parser.parse_args()
 
     queries = args.queries or DEFAULT_QUERIES
@@ -1279,14 +1356,16 @@ def main():
         return
 
     # Pre-scan all videos with YOLO (basic mode for audio-filter, color optional)
-    use_color = args.color and not args.audio_filter
-    mode_label = "audio-filter" if args.audio_filter else ("color" if use_color else "width")
-    logger.info(f"\nPre-scanning all videos with YOLO...")
-    cache, valid = scan_all_videos(model, valid, use_color=use_color)
+    use_color = args.color and not args.audio_filter and not args.title_hint
+    mode_label = "title-hint" if args.title_hint else (
+        "audio-filter" if args.audio_filter else ("color" if use_color else "width"))
+    logger.info(f"\nPre-scanning all videos with YOLO (sample_fps={args.sample_fps}, conf={args.conf})...")
+    cache, valid = scan_all_videos(model, valid, use_color=use_color,
+                                   sample_fps=args.sample_fps, conf=args.conf)
 
-    # Audio scanning (for audio-filter mode) with cache
+    # Audio scanning (for audio-filter or title-hint mode) with cache
     audio_cache = {}
-    if args.audio_filter:
+    if args.audio_filter or args.title_hint:
         if NCC_CACHE_FILE.exists():
             with open(NCC_CACHE_FILE, "r") as f:
                 audio_cache = json.load(f)
@@ -1319,6 +1398,43 @@ def main():
             logger.info(f"  NCC direct (thresh={thresh:.2f}): "
                         f"{correct}/{total} ({correct/total:.0%})")
 
+    if args.title_hint and args.tune:
+        # Title-hint grid search
+        logger.info("\n" + "=" * 60)
+        logger.info("TITLE-HINT GRID SEARCH")
+        logger.info("=" * 60)
+
+        best_params, best_result = run_title_hint_grid_search(
+            cache, audio_cache, valid
+        )
+
+        # Save best params
+        BEST_PARAMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BEST_PARAMS_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "params": {**best_params, "sample_fps": args.sample_fps, "conf": args.conf},
+                "mode": "title_hint",
+                "accuracy": best_result["accuracy"],
+                "total_videos": best_result["total_videos"],
+                "correct": best_result["correct"],
+                "by_query": best_result.get("by_query", {}),
+                "tuned_at": datetime.now().isoformat(),
+            }, f, indent=2)
+        logger.info(f"Best params saved to {BEST_PARAMS_FILE}")
+
+        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(best_result, f, indent=2, ensure_ascii=False)
+        logger.info(f"Results saved to {RESULTS_FILE}")
+
+        # Show failures for best result
+        failures = [d for d in best_result["details"] if not d["correct"]]
+        if failures:
+            logger.info(f"\nFailed ({len(failures)}):")
+            for fl in failures:
+                logger.info(f"  {fl['video']}: det={fl['detected']} exp={fl['expected']} "
+                             f"[{fl['method']}]")
+        return
+
     if args.title_hint:
         # Title-hint mode: use expected kills from title
         logger.info("\n" + "=" * 60)
@@ -1348,9 +1464,9 @@ def main():
         failures = [d for d in result["details"] if not d["correct"]]
         if failures:
             logger.info(f"\nFailed ({len(failures)}):")
-            for f in failures:
-                logger.info(f"  {f['video']}: det={f['detected']} exp={f['expected']} "
-                             f"[{f['method']}]")
+            for fl in failures:
+                logger.info(f"  {fl['video']}: det={fl['detected']} exp={fl['expected']} "
+                             f"[{fl['method']}]")
 
         with open(RESULTS_FILE, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
