@@ -3,10 +3,11 @@ downloads/
 clips/
 metadata/
 debug_frames/
+debug_crops/
+debug_fullframes/
 *.mp4
 *.avi
 *.mkv
-*.wav
 
 # Python
 __pycache__/
@@ -36,15 +37,22 @@ CLAUDE.md
 test_detection.py
 check_kills.py
 roi_diagnostic.py
+analyze_failures.py
+cs2_my_kills.py
+benchmark_*.json
 
-# ML models and training data
+# ML models and training data (best.pt is tracked for production use)
 models/*.pkl
 training_data/
 training_videos.json
 medal_api_key.txt
+datasets/
+runs/
+yolo11n.pt
 
-# Reference sounds (extracted from game files)
-reference_sounds/*.wav
+# Reference sounds (keep only production-required wav)
+reference_sounds/raw*/
+reference_sounds/extracted/
 
 # Logs
 *.log
