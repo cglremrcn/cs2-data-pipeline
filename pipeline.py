@@ -1344,11 +1344,12 @@ class CS2DataPipeline:
         sample_interval = int(round(fps * 0.1))  # 1 frame every 0.1s (6 frames at 60fps)
         kill_dirs = []
 
-        # Calculate boundaries so kills don't overlap each other's frames
-        kill_timestamps = [det["timestamp"] for det in detections]
+        # Offset: kill feed updates ~0.75s after the actual kill moment
+        kill_frame_offset = 0.75
+        kill_timestamps = [max(0, det["timestamp"] - kill_frame_offset) for det in detections]
 
         for i, det in enumerate(detections):
-            kill_frame_num = int(det["timestamp"] * fps)
+            kill_frame_num = int(kill_timestamps[i] * fps)
             kill_dir = session_dir / f"kill_{i + 1:03d}"
             kill_dir.mkdir(parents=True, exist_ok=True)
 
