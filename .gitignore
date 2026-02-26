@@ -41,8 +41,9 @@ analyze_failures.py
 cs2_my_kills.py
 benchmark_*.json
 
-# ML models and training data (best.pt is tracked for production use)
+# ML models and training data (best.pt and kill_classifier.pkl tracked for production)
 models/*.pkl
+!models/kill_classifier.pkl
 training_data/
 training_videos.json
 medal_api_key.txt
