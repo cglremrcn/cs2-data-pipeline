@@ -519,6 +519,63 @@ class CS2DataPipeline:
     # -------------------------------------------------------------------------
 
     @staticmethod
+    def _has_red_border(frame, x1, y1, x2, y2):
+        """Check if kill feed entry has red border (player's own kill).
+
+        CS2 marks the local player's kills with a 2px solid #e10000 red border
+        and a dark-red gradient background (#990b0b → black).
+
+        Combines two signals:
+        1. Dark-pixel red excess (R dominance in dark background pixels)
+        2. Left-right gradient (player kills have left=red → right=black)
+        Returns (is_red, combined_score).
+        """
+        h, w = frame.shape[:2]
+        bw = x2 - x1
+
+        region = frame[y1:y2, x1:x2]
+        if region.size == 0 or bw < 20:
+            return False, 0.0
+
+        px = region.reshape(-1, 3).astype(np.float32)
+        brightness = px.max(axis=1)
+        dark_mask = brightness < 90
+        dark_px = px[dark_mask]
+
+        if len(dark_px) < 10:
+            return False, 0.0
+
+        # --- Signal 1: Overall dark-pixel red excess ---
+        r_mean = float(np.mean(dark_px[:, 2]))
+        gb_mean = float(np.mean((dark_px[:, 1] + dark_px[:, 0]) / 2))
+        red_excess = r_mean - gb_mean
+
+        # --- Signal 2: Left-right gradient ---
+        left_w = max(1, int(bw * 0.35))
+        right_start = bw - left_w
+        left_region = region[:, :left_w]
+        right_region = region[:, right_start:]
+
+        def _dark_r_excess(sub):
+            spx = sub.reshape(-1, 3).astype(np.float32)
+            br = spx.max(axis=1)
+            dk = spx[br < 90]
+            if len(dk) < 5:
+                return 0.0
+            return float(np.mean(dk[:, 2] - (dk[:, 1] + dk[:, 0]) / 2))
+
+        gradient = _dark_r_excess(left_region) - _dark_r_excess(right_region)
+
+        # Combined score (both normalized to ~0-1 range)
+        excess_score = max(0.0, red_excess / 50.0)
+        gradient_score = max(0.0, gradient / 40.0)
+        score = excess_score * 0.5 + gradient_score * 0.5
+
+        is_red = score > 0.0
+
+        return is_red, round(score, 4)
+
+    @staticmethod
     def _compare_signatures(a, b):
         """Normalized correlation between two grayscale image signatures."""
         if a is None or b is None:
@@ -534,10 +591,13 @@ class CS2DataPipeline:
 
     def _detect_kills_yolo_killfeed(self, video_path, fps, width, height):
         """
-        Detect kills using YOLO kill feed detection.
+        Detect kills using YOLO kill feed detection + red border filtering.
 
-        Returns (width_filtered_kills, all_transition_times):
-        - width_filtered_kills: list of detection dicts (width heuristic, for fallback)
+        CS2 marks the player's own kills with a red border (#e10000) in the
+        kill feed. We use this to distinguish player kills from other kills.
+
+        Returns (red_border_kills, all_transition_times):
+        - red_border_kills: list of detection dicts (red border filtered)
         - all_transition_times: list of ALL transition timestamps (for audio filtering)
         """
         model = self._load_yolo_model()
@@ -586,6 +646,10 @@ class CS2DataPipeline:
 
                 if best is not None:
                     x1, y1, x2, y2, bw, bh = best
+                    # Check for red border (player's own kill indicator)
+                    has_red, red_score = self._has_red_border(
+                        frame, x1, y1, x2, y2
+                    )
                     crop_w = min(int(bw * 0.40), int(width * 0.18))
                     crop = frame[y1:y2, x1:min(x1 + crop_w, width)]
                     if crop.size > 0:
@@ -597,6 +661,8 @@ class CS2DataPipeline:
                         all_detections.append({
                             "ts": round(ts, 2), "bw": bw,
                             "sim": round(sim, 4),
+                            "has_red": has_red,
+                            "red_score": red_score,
                         })
                         prev_sig = sig
 
@@ -630,50 +696,76 @@ class CS2DataPipeline:
         # All transition times (for audio filtering)
         all_transition_times = _dedup(transitions)
 
-        # Width heuristic (fallback when no audio)
-        if len(transitions) < 3:
-            kill_times = [t["ts"] for t in transitions]
-            method = "width_too_few"
-        else:
-            all_widths = [t["bw"] for t in transitions]
-            widths_sorted = sorted(set(all_widths))
-            max_gap = 0
-            gap_idx = 0
-            for i in range(len(widths_sorted) - 1):
-                gap = widths_sorted[i + 1] - widths_sorted[i]
-                if gap > max_gap:
-                    max_gap = gap
-                    gap_idx = i
+        # Red border filter: player's own kills have red border in CS2.
+        # Use adaptive thresholding: compute max red_score in a window
+        # after each transition, then split by score gap (like width heuristic).
+        lookahead = 0.6  # seconds to check after transition
 
-            width_range = max(all_widths) - min(all_widths)
-            width_mean = np.mean(all_widths)
-            width_ratio = width_range / width_mean if width_mean > 0 else 0
-            wrt = p.get("width_ratio_threshold", 0.15)
-            gt = p.get("gap_threshold", 15)
+        # Compute best red_score for each transition (check following frames)
+        for trans in transitions:
+            t_ts = trans["ts"]
+            nearby_scores = [
+                d.get("red_score", 0.0)
+                for d in all_detections
+                if t_ts <= d["ts"] <= t_ts + lookahead
+            ]
+            trans["best_red"] = max(nearby_scores) if nearby_scores else 0.0
 
-            if width_ratio < wrt and max_gap < gt:
-                kill_times = _dedup(transitions)
-                method = "width_homogeneous"
+        # Adaptive split: find gap between high-red and low-red transitions
+        scores = sorted(set(t["best_red"] for t in transitions))
+        total_count = len(transitions)
+
+        if len(scores) >= 2:
+            # Find largest gap in scores
+            max_gap = 0.0
+            gap_val = 0.0
+            for i in range(len(scores) - 1):
+                g = scores[i + 1] - scores[i]
+                if g > max_gap:
+                    max_gap = g
+                    gap_val = (scores[i] + scores[i + 1]) / 2
+
+            # Also compute mean score
+            mean_score = np.mean([t["best_red"] for t in transitions])
+
+            # Use gap if significant, otherwise use mean
+            if max_gap >= 0.03:
+                threshold = gap_val
             else:
-                if max_gap >= gt:
-                    gap_thresh = (widths_sorted[gap_idx] + widths_sorted[gap_idx + 1]) / 2
-                else:
-                    gap_thresh = width_mean
-                gap_times = _dedup([t for t in transitions if t["bw"] >= gap_thresh])
-                mean_times = _dedup([t for t in transitions if t["bw"] >= width_mean])
-                kill_times = gap_times if len(gap_times) <= len(mean_times) else mean_times
-                method = "width_split"
+                threshold = mean_score
 
-        logger.info(f"  YOLO width ({method}): {len(kill_times)} kills, "
+            red_transitions = [t for t in transitions if t["best_red"] >= threshold]
+            non_red = [t for t in transitions if t["best_red"] < threshold]
+
+            # Sanity: if more than 80% are "red", likely all are player kills
+            if len(red_transitions) > 0.8 * total_count:
+                kill_times = _dedup(transitions)
+                method = "red_border_homogeneous"
+            elif len(red_transitions) > 0:
+                kill_times = _dedup(red_transitions)
+                method = "red_border"
+            else:
+                kill_times = _dedup(transitions)
+                method = "red_border_fallback"
+
+            logger.info(f"  Red score split: gap={max_gap:.4f} thresh={threshold:.4f} "
+                        f"→ {len(red_transitions)}/{total_count} red")
+        else:
+            kill_times = _dedup(transitions)
+            method = "red_border_fallback"
+            logger.info(f"  Single score value — using all transitions")
+
+        logger.info(f"  YOLO ({method}): {len(kill_times)} kills, "
                     f"all transitions: {len(all_transition_times)}")
 
-        # Build detection dicts for width-filtered kills
+        # Build detection dicts
         detections = []
+        conf = 0.9 if method == "red_border" else 0.6
         for ts in kill_times:
             detections.append({
                 "timestamp": ts,
                 "frame_number": int(ts * fps),
-                "confidence": 0.8,
+                "confidence": conf,
                 "detection_method": f"yolo_killfeed_{method}",
             })
 
