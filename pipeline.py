@@ -276,14 +276,14 @@ class CS2DataPipeline:
         logger.info(f"Video: {width}x{height}, {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
 
         # --- YOLO: detect ALL kill feed transitions ---
-        yolo_width_kills = []
+        yolo_red_kills = []
         all_transitions = []
         try:
-            yolo_width_kills, all_transitions = self._detect_kills_yolo_killfeed(
+            yolo_red_kills, all_transitions = self._detect_kills_yolo_killfeed(
                 video_path, fps, width, height
             )
             logger.info(f"YOLO: {len(all_transitions)} transitions, "
-                        f"{len(yolo_width_kills)} width-filtered")
+                        f"{len(yolo_red_kills)} red-border-filtered")
         except Exception as e:
             logger.warning(f"YOLO detection failed: {e}")
 
@@ -374,16 +374,45 @@ class CS2DataPipeline:
                 logger.info(f"Audio-filtered: {len(result)} kills "
                             f"({len(all_transitions)} transitions × "
                             f"{len(ncc_times)} audio peaks)")
-            elif yolo_width_kills:
-                result = yolo_width_kills
-                logger.info(f"Audio filter matched 0 → width fallback "
+            elif yolo_red_kills:
+                result = yolo_red_kills
+                logger.info(f"Audio filter matched 0 → red border fallback "
+                            f"({len(result)} kills)")
+            elif ncc_times:
+                # Both intersection and red border empty — trust NCC alone
+                kill_times_ncc = []
+                for t in sorted(ncc_times):
+                    if not kill_times_ncc or t - kill_times_ncc[-1] >= cooldown:
+                        kill_times_ncc.append(t)
+                result = [{
+                    "timestamp": ts,
+                    "frame_number": int(ts * fps),
+                    "confidence": 0.6,
+                    "detection_method": "ncc_fallback_after_filter",
+                } for ts in kill_times_ncc]
+                logger.info(f"Audio filter + red border both failed → NCC fallback "
                             f"({len(result)} kills)")
             else:
                 result = []
 
-        elif yolo_width_kills:
-            result = yolo_width_kills
-            logger.info(f"No audio → YOLO width ({len(result)} kills)")
+        elif yolo_red_kills:
+            result = yolo_red_kills
+            logger.info(f"No audio → YOLO red border ({len(result)} kills)")
+
+        elif ncc_times:
+            # NCC-ONLY: YOLO found nothing but audio detected kill sounds
+            kill_times = []
+            for t in sorted(ncc_times):
+                if not kill_times or t - kill_times[-1] >= cooldown:
+                    kill_times.append(t)
+            result = [{
+                "timestamp": ts,
+                "frame_number": int(ts * fps),
+                "confidence": 0.65,
+                "detection_method": "ncc_only",
+            } for ts in kill_times]
+            logger.info(f"NCC-only fallback: {len(result)} kills "
+                        f"(no YOLO detections)")
 
         else:
             logger.info("No kills detected by any method")
@@ -589,36 +618,16 @@ class CS2DataPipeline:
             return 0.0
         return float(np.dot(fa, fb) / (na * nb))
 
-    def _detect_kills_yolo_killfeed(self, video_path, fps, width, height):
-        """
-        Detect kills using YOLO kill feed detection + red border filtering.
-
-        CS2 marks the player's own kills with a red border (#e10000) in the
-        kill feed. We use this to distinguish player kills from other kills.
-
-        Returns (red_border_kills, all_transition_times):
-        - red_border_kills: list of detection dicts (red border filtered)
-        - all_transition_times: list of ALL transition timestamps (for audio filtering)
-        """
-        model = self._load_yolo_model()
-        if model is None:
-            return [], []
-
-        p = self._yolo_params
-
+    def _yolo_scan_frames(self, model, video_path, fps, width, height,
+                          conf, min_x, max_y, min_y, interval):
+        """Scan video frames with YOLO and return raw detections."""
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            return [], []
+            return []
 
-        # Kill feed region: top-right corner
-        min_x = int(width * 0.55)
-        max_y = int(height * 0.22)
-        min_y = int(height * 0.02)
-
-        interval = max(1, int(fps / p["sample_fps"]))
         frame_idx = 0
         prev_sig = None
-        all_detections = []
+        detections = []
 
         while True:
             ret, frame = cap.read()
@@ -626,7 +635,7 @@ class CS2DataPipeline:
                 break
             if frame_idx % interval == 0:
                 ts = frame_idx / fps
-                results = model(frame, conf=p["conf"], verbose=False)
+                results = model(frame, conf=conf, verbose=False)
                 best = None
                 for r in results:
                     if r.boxes is None:
@@ -646,7 +655,6 @@ class CS2DataPipeline:
 
                 if best is not None:
                     x1, y1, x2, y2, bw, bh = best
-                    # Check for red border (player's own kill indicator)
                     has_red, red_score = self._has_red_border(
                         frame, x1, y1, x2, y2
                     )
@@ -658,7 +666,7 @@ class CS2DataPipeline:
                         )
                         sim = (self._compare_signatures(sig, prev_sig)
                                if prev_sig is not None else 0.0)
-                        all_detections.append({
+                        detections.append({
                             "ts": round(ts, 2), "bw": bw,
                             "sim": round(sim, 4),
                             "has_red": has_red,
@@ -668,6 +676,48 @@ class CS2DataPipeline:
 
             frame_idx += 1
         cap.release()
+        return detections
+
+    def _detect_kills_yolo_killfeed(self, video_path, fps, width, height):
+        """
+        Detect kills using YOLO kill feed detection + red border filtering.
+
+        CS2 marks the player's own kills with a red border (#e10000) in the
+        kill feed. We use this to distinguish player kills from other kills.
+
+        Returns (red_border_kills, all_transition_times):
+        - red_border_kills: list of detection dicts (red border filtered)
+        - all_transition_times: list of ALL transition timestamps (for audio filtering)
+        """
+        model = self._load_yolo_model()
+        if model is None:
+            return [], []
+
+        p = self._yolo_params
+
+        # Kill feed region: top-right corner
+        min_x = int(width * 0.55)
+        max_y = int(height * 0.22)
+        min_y = int(height * 0.02)
+        interval = max(1, int(fps / p["sample_fps"]))
+
+        # First pass with normal params
+        all_detections = self._yolo_scan_frames(
+            model, video_path, fps, width, height,
+            p["conf"], min_x, max_y, min_y, interval
+        )
+
+        # Retry with relaxed params if no detections found
+        if not all_detections:
+            retry_conf = max(0.20, p["conf"] - 0.10)
+            retry_min_x = int(width * 0.45)
+            logger.info(f"  YOLO retry: conf={retry_conf:.2f}, min_x ratio=0.45")
+            all_detections = self._yolo_scan_frames(
+                model, video_path, fps, width, height,
+                retry_conf, retry_min_x, max_y, min_y, interval
+            )
+            if all_detections:
+                logger.info(f"  YOLO retry found {len(all_detections)} detections")
 
         # Filter transitions by similarity
         sim_thresh = p.get("sim_threshold", 0.55)
@@ -714,6 +764,7 @@ class CS2DataPipeline:
         # Adaptive split: find gap between high-red and low-red transitions
         scores = sorted(set(t["best_red"] for t in transitions))
         total_count = len(transitions)
+        MIN_RED_SCORE = 0.05  # floor: noise scores below this are never "red"
 
         if len(scores) >= 2:
             # Find largest gap in scores
@@ -728,17 +779,20 @@ class CS2DataPipeline:
             # Also compute mean score
             mean_score = np.mean([t["best_red"] for t in transitions])
 
-            # Use gap if significant, otherwise use mean
-            if max_gap >= 0.03:
+            # Use gap if significant AND midpoint above minimum
+            if max_gap >= 0.05 and gap_val >= MIN_RED_SCORE:
                 threshold = gap_val
+            elif mean_score >= MIN_RED_SCORE:
+                threshold = max(mean_score, MIN_RED_SCORE)
             else:
-                threshold = mean_score
+                threshold = MIN_RED_SCORE
 
             red_transitions = [t for t in transitions if t["best_red"] >= threshold]
             non_red = [t for t in transitions if t["best_red"] < threshold]
 
-            # Sanity: if more than 80% are "red", likely all are player kills
-            if len(red_transitions) > 0.8 * total_count:
+            # Sanity: if more than 70% are "red" (and at least 3 total),
+            # likely all are player kills (e.g. ace clip)
+            if len(red_transitions) > 0.7 * total_count and total_count >= 3:
                 kill_times = _dedup(transitions)
                 method = "red_border_homogeneous"
             elif len(red_transitions) > 0:
